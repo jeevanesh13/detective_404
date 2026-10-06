@@ -24,6 +24,10 @@ const defaultUrl = { player: PORT, admin: ADMIN_PORT };
 /** Where the *other* site lives, so each screen can link across. */
 function siteUrls({ command, urls }) {
   if (urls) return urls;
+  // Single-port deploys (Render, Railway…) serve both sites from one origin:
+  // the player entrance at `/`, the game master console at `/admin`. Relative
+  // links then keep working whatever domain the service is published on.
+  if (String(process.env.D404_SINGLE_PORT || "") === "1") return { player: "/", admin: "/admin" };
   const portFor = (site) =>
     command === "build"
       ? defaultUrl[site]

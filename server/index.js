@@ -89,17 +89,50 @@ function serveStatic(req, res, site) {
 
 const adminState = seedAdmin();
 
-const servers = SITES.map((site) => {
-  const server = http.createServer(async (req, res) => {
-    try {
-      const handled = await handleRequest(req, res);
-      if (!handled && !res.headersSent && !res.writableEnded) serveStatic(req, res, site);
-    } catch (err) {
-      console.error("[deductive-404]", err);
-      if (!res.headersSent) res.writeHead(500, { "Content-Type": "text/plain" });
-      if (!res.writableEnded) res.end("Server error");
+/**
+ * Single-port mode — for hosts that publish exactly one port (Render, Railway,
+ * Fly…): the player entrance stays at `/` and the game master console is served
+ * at `/admin`, both from the same listener. Opt in with D404_SINGLE_PORT=1.
+ * Without it every site keeps its own port, exactly as before.
+ */
+const SINGLE_PORT = String(process.env.D404_SINGLE_PORT || "") === "1";
+const siteOf = (key) => SITES.find((s) => s.key === key);
+
+function pathnameOf(req) {
+  try {
+    return decodeURIComponent(new URL(req.url || "/", "http://x").pathname);
+  } catch {
+    return "/";
+  }
+}
+
+/** With both bundles behind one port, decide which one owns this path. */
+function siteForPath(pathname) {
+  if (pathname === "/admin" || pathname === "/admin/" || pathname === "/admin.html") return siteOf("admin");
+  // Both builds emit into /assets, but the files are prefixed index-* vs admin-*.
+  if (pathname.startsWith("/assets/")) {
+    const inPlayer = fs.existsSync(path.join(DIST_DIR, pathname));
+    if (!inPlayer && fs.existsSync(path.join(ADMIN_DIST_DIR, pathname))) return siteOf("admin");
+  }
+  return siteOf("player");
+}
+
+const makeHandler = (defaultSite) => async (req, res) => {
+  try {
+    const handled = await handleRequest(req, res);
+    if (!handled && !res.headersSent && !res.writableEnded) {
+      const site = SINGLE_PORT ? siteForPath(pathnameOf(req)) : defaultSite;
+      serveStatic(req, res, site);
     }
-  });
+  } catch (err) {
+    console.error("[deductive-404]", err);
+    if (!res.headersSent) res.writeHead(500, { "Content-Type": "text/plain" });
+    if (!res.writableEnded) res.end("Server error");
+  }
+};
+
+const servers = (SINGLE_PORT ? SITES.slice(0, 1) : SITES).map((site) => {
+  const server = http.createServer(makeHandler(site));
   server.on("error", (err) => {
     console.error(`[deductive-404] ${site.label} could not bind port ${site.port} — ${err.message}`);
     process.exit(1);
@@ -115,8 +148,12 @@ for (const { site, server } of servers) {
     console.log("  ┌───────────────────────────────────────────────────┐");
     console.log("  │  DETECTIVE 404 — TWO SITES, ONE BACKEND           │");
     console.log("  └───────────────────────────────────────────────────┘");
-    console.log(`   Detective entrance : http://localhost:${SITES[0].port}/`);
-    console.log(`   Game master console: http://localhost:${SITES[1].port}/`);
+    console.log(`   Detective entrance : http://localhost:${PORT}/`);
+    console.log(
+      SINGLE_PORT
+        ? `   Game master console: http://localhost:${PORT}/admin   (single-port mode)`
+        : `   Game master console: http://localhost:${ADMIN_PORT}/`
+    );
     console.log(`   Database           : ${path.relative(ROOT, path.join(DATA_DIR, "deductive404.db"))}`);
     console.log(`   Admin account      : ${ADMIN_USER} (${adminState}) · password from D404_ADMIN_PASSWORD`);
     console.log("");
