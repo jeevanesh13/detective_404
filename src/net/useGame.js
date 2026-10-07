@@ -185,7 +185,9 @@ export function useGame(activeRole = "player") {
   }, [activeRole, playerSession?.token]);
 
   /* ---------------- local tick for a smooth countdown ---------------- */
-  const hasClock = !!room && room.status !== "waiting";
+  // Each detective's clock only needs to run once THEY pressed START;
+  // the game master's console keeps ticking for as long as the room is live.
+  const hasClock = activeRole === "admin" ? !!room && room.status !== "waiting" : !!you?.startedAt;
   useEffect(() => {
     if (!hasClock) return;
     const id = setInterval(() => setServerNow(Date.now() + offsetRef.current), 400);
@@ -248,8 +250,9 @@ export function useGame(activeRole = "player") {
     const s = playerRef.current;
     if (!s) throw new ApiError("UNAUTHORIZED", "Join the room first.", 401);
     const data = await api.startGame(s.token);
-    // One shared room state: everybody in the room moves to the same case,
-    // the same question list and the same countdown.
+    // INDIVIDUAL start: this response — and only this response — moves THIS
+    // detective into the case with their own full-length timer. Nobody else
+    // in the room is started, reset or pushed to another screen by it.
     if (data.room) setRoom(data.room);
     if (data.players) setPlayers(data.players);
     if (data.you) setYou(data.you);

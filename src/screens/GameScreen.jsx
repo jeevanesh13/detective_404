@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { norm, tooLong, MAX_ANSWER_WORDS, MAX_ATTEMPTS } from "../game/logic.js";
 import Logo from "../ui/Logo.jsx";
-import { fmtClock, remainingMs } from "../net/time.js";
+import { fmtClock, playerRemainingMs } from "../net/time.js";
 
 /**
  * The detective game screen.
@@ -44,7 +44,9 @@ export default function GameScreen({ game }) {
   const attemptsUsed = question ? question.attempts : you?.attempts || 0;
   const attemptsLeft = question ? question.attemptsLeft : you?.attemptsLeft ?? MAX_ATTEMPTS;
 
-  const remaining = remainingMs(room, serverNow);
+  // YOUR personal countdown: endsAt is the expiry the server stored when
+  // YOU pressed START — nobody else's start can move it.
+  const remaining = playerRemainingMs(you, room, serverNow);
   const low = remaining <= 60_000;
   const done = you?.status === "finished";
   const isText = question?.type === "text";

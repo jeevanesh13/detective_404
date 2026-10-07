@@ -21,7 +21,8 @@ import {
   POINTS_SECOND,
   QUESTION_TYPES,
   pointsFor,
-  remainingMs,
+  playerRemainingMs,
+  roomRemainingMs,
   rank,
 } from "./game.js";
 import { MAX_BODY, MAX_UPLOAD, UPLOAD_TYPES, UPLOADS_DIR, clampDuration, TICK_MS, MAX_PLAYERS_PER_ROOM, NAME_GRACE_MS } from "./config.js";
@@ -239,10 +240,13 @@ function ownedRoom(req, url, body = {}) {
 /* ------------------------------------------------------------------ *
  * Shapes sent to the browser
  * ------------------------------------------------------------------ */
+/* One detective's status is derived from THEIR session (did they press
+   START, has THEIR clock run out), never from what the room is doing. */
 function phaseStatus(p, room) {
   if (p.status === "finished") return "finished";
   if (room.status === "ended") return "timeout";
-  if (room.status === "waiting") return "waiting";
+  if (!p.started_at) return "waiting";
+  if (p.timed_out || playerRemainingMs(room, p) <= 0) return "timeout";
   return "playing";
 }
 
@@ -268,6 +272,10 @@ function youShape(p, room, online) {
   const prog = store.getProgress(p.id, p.current_case);
   return {
     ...rosterShape(p, room, online),
+    // THIS detective's personal session: only ever their own timestamps
+    startedAt: p.started_at,
+    endsAt: p.ends_at,
+    remaining: playerRemainingMs(room, p),
     correct: p.correct_count,
     wrong: p.wrong_count,
     completedCount: store.completedCount(p.id),
@@ -287,6 +295,9 @@ function adminShape(p, room, online) {
   const prog = store.getProgress(p.id, p.current_case);
   return {
     ...rosterShape(p, room, online),
+    // per-seat clock so the game master can watch every timer individually
+    startedAt: p.started_at,
+    endsAt: p.ends_at,
     correct: p.correct_count,
     wrong: p.wrong_count,
     attempts: prog ? prog.attempts : 0,
@@ -321,7 +332,7 @@ function publicRoom(room, players, onlineCount) {
     gameName: game ? game.name : null,
     gameDescription: game ? game.description : "",
     totalCases: totalCasesOf(room),
-    remaining: remainingMs(room),
+    remaining: roomRemainingMs(room, players),
   };
 }
 
@@ -386,7 +397,7 @@ function roomsSummaryFor(adminId) {
       capacity: MAX_PLAYERS_PER_ROOM,
       online: online.size,
       finished: players.filter((p) => p.status === "finished").length,
-      remaining: remainingMs(room),
+      remaining: roomRemainingMs(room, players),
       gameId: room.game_id || null,
       gameName: game ? game.name : null,
       totalCases: totalCasesOf(room),
@@ -397,6 +408,27 @@ function roomsSummaryFor(adminId) {
 /** Push the authoritative room state to every detective + game master in it. */
 function syncRoom(roomId) {
   hub.broadcastRoomScoped(roomId, "state", (c) => stateFor(roomId, c));
+  hub.eachAdmin((c) => {
+    hub.emit(c, "rooms", { type: "rooms", serverTime: Date.now(), rooms: roomsSummaryFor(c.adminId) });
+  });
+}
+
+/**
+ * Push state to ONE detective's own sockets and nobody else's. A personal
+ * START (and a personal time-up) is a private event: the rest of the room
+ * is never told "the game started" on someone else's behalf.
+ */
+function syncPlayer(roomId, playerId) {
+  for (const c of hub.roomClients(roomId)) {
+    if (c.role === "player" && c.playerId === playerId) hub.emit(c, "state", stateFor(roomId, c));
+  }
+}
+
+/** Push state to the game-master consoles watching this room (monitoring). */
+function syncAdmins(roomId) {
+  for (const c of hub.roomClients(roomId)) {
+    if (c.role === "admin") hub.emit(c, "state", stateFor(roomId, c));
+  }
   hub.eachAdmin((c) => {
     hub.emit(c, "rooms", { type: "rooms", serverTime: Date.now(), rooms: roomsSummaryFor(c.adminId) });
   });
@@ -427,53 +459,133 @@ export function endRoom(room, reason = "admin") {
 }
 
 /**
- * Start the room's SHARED game session.
- *
- * There is exactly one game state per room: whoever triggers it, every
- * detective already in that room sees the same case, the same question list
- * and the same countdown. Only scores, answers and progress stay per player.
- *
- * Minimum to start = 1 detective. Capacity is a separate ceiling
- * (MAX_PLAYERS_PER_ROOM) — the room never waits to be full before starting.
+ * Lock ONE detective whose personal clock ran out — and only them.
+ * Their own sockets are told privately; the game master monitors it like
+ * any other roster change. The room itself keeps running for everyone who
+ * still has time.
  */
-function startRoomSession(room) {
-  if (room.status === "live") throw new ApiError("ALREADY_LIVE", "The game is already running.");
-  if (room.status === "paused") throw new ApiError("PAUSED", "Resume the game instead.");
+function expirePlayer(room, player) {
+  const now = Date.now();
+  if (player.status === "finished") return player; // case already closed — nothing to lock
+  const updated = store.updatePlayer(player.id, { timed_out: 1, last_active: now });
+  syncPlayer(room.id, player.id);
+  syncAdmins(room.id);
+  return updated;
+}
+
+/**
+ * Start ONE detective's personal session.
+ *
+ * Each seat owns its own clock:
+ *   startedAt = the moment THAT detective pressed START
+ *   endsAt    = startedAt + the room's configured duration
+ * The function only ever reads/writes this player's row (plus, on the very
+ * first start, stamps the room itself as live for the game master's console
+ * and the pause/end controls). One detective's START therefore can never
+ * start, reset, pause or shorten another detective's timer, and pressing it
+ * twice is idempotent — an existing clock is NEVER reset.
+ */
+function startPlayerSession(room, player, now = Date.now()) {
   if (room.status === "ended") throw new ApiError("ENDED", "Reset the room before starting a new game.");
+  if (room.status === "paused")
+    throw new ApiError("PAUSED", "The game is paused — the game master has to resume it first.");
   const game = gameOf(room);
   if (!game) throw new ApiError("NO_GAME", "This room has no game yet — ask the game master to assign one.");
   if (game.status !== "published") throw new ApiError("GAME_DRAFT", "This game is not published yet.");
   if (!totalCasesOf(room)) throw new ApiError("GAME_EMPTY", "The assigned game has no cases yet.");
 
-  const start = Date.now();
-  let updated;
+  let roomRow = room;
+  let me = player;
+  let startedNow = false;
   store.withTx(() => {
-    updated = store.updateRoom(room.id, {
-      status: "live",
-      started_at: start,
-      paused_since: null,
-      paused_total: 0,
-      ended_at: null,
-    });
-    store.touchSession(room.id, { start_time: start, end_time: null, duration: updated.duration, status: "live" });
+    const freshRoom = store.findRoomById(room.id);
+    if (freshRoom.status === "ended") throw new ApiError("ENDED", "Reset the room before starting a new game.");
+    if (freshRoom.status === "paused")
+      throw new ApiError("PAUSED", "The game is paused — the game master has to resume it first.");
+    if (freshRoom.status === "waiting") {
+      // the room only records when the FIRST seat opened the case file
+      roomRow = store.updateRoom(freshRoom.id, {
+        status: "live",
+        started_at: now,
+        paused_since: null,
+        ended_at: null,
+      });
+      store.touchSession(freshRoom.id, {
+        start_time: now,
+        end_time: null,
+        duration: roomRow.duration,
+        status: "live",
+      });
+    } else {
+      roomRow = freshRoom;
+    }
+    const fresh = store.findPlayer(player.id);
+    if (!fresh.started_at) {
+      startedNow = true;
+      me = store.updatePlayer(fresh.id, {
+        started_at: now,
+        ends_at: now + roomRow.duration, // their OWN full-length timer
+        case_started_at: now, // their personal case clock starts with it
+        timed_out: 0,
+      });
+    }
+    // already started -> idempotent, their stored clock stays untouched
   });
-  return updated;
+  return { room: roomRow, player: me, startedNow };
 }
 
 /* ------------------------------------------------------------------ *
- * One tick per second: keep every client's countdown identical to the
- * server's and auto-close the case when time runs out.
+ * Personal clocks
+ * ------------------------------------------------------------------ */
+/** Lock every seat whose own timer has run out. Returns them. */
+function expireElapsedPlayers(room, now = Date.now()) {
+  const expired = [];
+  for (const p of store.listPlayers(room.id)) {
+    if (!p.started_at || p.timed_out || p.status === "finished") continue;
+    if (playerRemainingMs(room, p, now) > 0) continue;
+    store.updatePlayer(p.id, { timed_out: 1, last_active: now });
+    expired.push(p);
+  }
+  return expired;
+}
+
+function pushExpiry(room, expired) {
+  if (!expired.length) return;
+  for (const p of expired) syncPlayer(room.id, p.id); // only their own screen flips
+  syncAdmins(room.id); // the game master watches every seat
+}
+
+/**
+ * The ROOM itself closes only once every seat has had its turn: somebody
+ * started, nobody is still waiting to press START, and every started clock
+ * is either spent or their case is already closed. One player hitting 00:00
+ * therefore never ends the game for the rest of the room.
+ */
+function roomTurnsOver(room, now = Date.now()) {
+  const players = store.listPlayers(room.id);
+  const started = players.filter((p) => p.started_at);
+  if (!started.length) return false;
+  if (players.some((p) => !p.started_at)) return false;
+  return started.every((p) => p.status === "finished" || p.timed_out || playerRemainingMs(room, p, now) <= 0);
+}
+
+/**
+ * One tick per second: every detective's countdown is re-derived from the
+ * server clock, personal time-ups lock only that detective, and the room
+ * closes only when all seats are done.
  * ------------------------------------------------------------------ */
 function tick() {
   const now = Date.now();
   for (const room of store.listRooms()) {
     if (room.status !== "live") continue;
-    const left = remainingMs(room, now);
-    if (left <= 0) {
+    const expired = expireElapsedPlayers(room, now);
+    if (roomTurnsOver(room, now)) {
+      pushExpiry(room, expired);
       endRoom(room, "time");
       continue;
     }
-    hub.broadcastRoom(room.id, "tick", { type: "tick", serverTime: now, remaining: left, status: "live" });
+    pushExpiry(room, expired);
+    hub.broadcastRoom(room.id, "tick", { type: "tick", serverTime: now, status: "live" });
   }
 }
 
@@ -482,9 +594,18 @@ function startTicker() {
   globalThis.__d404Ticker = setInterval(tick, TICK_MS);
   globalThis.__d404Ticker.unref?.();
 
-  // Settle any room a previous process left running.
+  // Settle any room a previous process left running: personal clocks that
+  // ran out while the server was down are locked, and a room whose every
+  // seat is spent is closed — otherwise it simply carries on.
   for (const room of store.reconcileRooms()) {
-    if (remainingMs(room) <= 0) endRoom(room, "restart");
+    if (room.status !== "live") continue;
+    const expired = expireElapsedPlayers(room);
+    if (roomTurnsOver(room)) {
+      pushExpiry(room, expired);
+      endRoom(room, "restart");
+    } else {
+      pushExpiry(room, expired);
+    }
   }
 }
 
@@ -632,7 +753,7 @@ async function route(req, res, url) {
     return send(res, 200, {
       serverTime: Date.now(),
       roomStatus: room.status,
-      remaining: remainingMs(room),
+      remaining: playerRemainingMs(room, updated), // this detective's own clock
       you: youShape(updated, room, hub.onlineIds(room.id)),
     });
   }
@@ -664,11 +785,14 @@ async function route(req, res, url) {
             ? "The game is paused."
             : "TIME'S UP. The investigation is closed."
       );
-    if (remainingMs(room) <= 0) {
-      endRoom(room, "time");
+    if (!player.started_at)
+      throw new ApiError("NOT_LIVE", "Your investigation has not started yet — press START GAME.");
+    if (player.status === "finished") throw new ApiError("FINISHED", "You have already closed the case.");
+    if (playerRemainingMs(room, player) <= 0) {
+      // THIS detective's own clock ran out: lock only them — the room plays on
+      expirePlayer(room, player);
       throw new ApiError("TIME_UP", "TIME'S UP");
     }
-    if (player.status === "finished") throw new ApiError("FINISHED", "You have already closed the case.");
 
     const game = gameOf(room);
     if (!game) throw new ApiError("NO_GAME", "The game master has not assigned a game to this room yet.");
@@ -767,6 +891,10 @@ async function route(req, res, url) {
     const { player, room } = requirePlayer(req, url);
     if (!player.awaiting_next) throw new ApiError("NOT_READY", "Complete this question before moving on.");
     if (room.status === "ended") throw new ApiError("ENDED", "The investigation is closed.");
+    if (player.started_at && playerRemainingMs(room, player) <= 0) {
+      expirePlayer(room, player); // their personal clock, not the room's
+      throw new ApiError("TIME_UP", "TIME'S UP");
+    }
 
     const total = totalCasesOf(room);
     let updated;
@@ -775,7 +903,7 @@ async function route(req, res, url) {
     store.withTx(() => {
       if (player.current_case >= total) {
         const finishedAt = Date.now();
-        const base = room.started_at || player.joined_at;
+        const base = player.started_at || room.started_at || player.joined_at;
         updated = store.updatePlayer(player.id, {
           status: "finished",
           finished_at: finishedAt,
@@ -809,30 +937,32 @@ async function route(req, res, url) {
   }
 
   /* ---------------------------------------------------------------- *
-   * START GAME — any detective in the room can begin the session.
+   * START GAME — INDIVIDUAL, pressed by each detective themselves.
    *
-   * The room has ONE shared state: this flips the room itself to live, so
-   * every player in it receives the same case, question list and countdown.
-   * It never creates a per-player game, and it needs no admin approval.
-   * A room may start with 1 detective (capacity 50 is a ceiling, not a
-   * minimum the room has to wait for).
+   * This starts ONLY the caller's session: their own started timestamp,
+   * their own expiry (start + the configured duration) and their own
+   * private push. Nobody else's timer is started, reset, paused or
+   * shortened by it, and no "game started" event is broadcast to the
+   * room — the game master's console is updated because it monitors.
+   * Minimum to start = this one seat; capacity stays a separate ceiling.
    * ---------------------------------------------------------------- */
   if (path === "/api/game/start" && method === "POST") {
     const { player, room } = requirePlayer(req, url); // session valid + room exists + this player's room
-    const seated = store.listPlayers(room.id);
-    if (!seated.length)
-      throw new ApiError("NO_PLAYERS", "At least one detective must be in the room before the game can start.");
 
-    const updated = startRoomSession(room); // one shared session for the whole room
-    const online = hub.onlineIds(updated.id);
-    syncRoom(updated.id); // push the new state to every connected player
+    const started = startPlayerSession(room, player); // one personal session for ONE seat
+    const online = hub.onlineIds(started.room.id);
+
+    syncPlayer(started.room.id, started.player.id); // PRIVATE: their own sockets only
+    if (started.startedNow) syncAdmins(started.room.id); // the game master monitors
+
     return send(res, 200, {
       started: true,
-      room: publicRoom(updated, store.listPlayers(updated.id), online.size),
-      players: store.listPlayers(updated.id).map((p) => rosterShape(p, updated, online)),
-      you: youShape(player, updated, online),
-      question: activeQuestionOf(updated, player),
-      questionList: questionListOf(updated, player),
+      alreadyStarted: !started.startedNow, // re-pressing START never resets the clock
+      room: publicRoom(started.room, store.listPlayers(started.room.id), online.size),
+      players: store.listPlayers(started.room.id).map((p) => rosterShape(p, started.room, online)),
+      you: youShape(started.player, started.room, online),
+      question: activeQuestionOf(started.room, started.player),
+      questionList: questionListOf(started.room, started.player),
     });
   }
 
@@ -1120,8 +1250,8 @@ async function route(req, res, url) {
 
   const adminActions = {
     /* START is deliberately absent: the game master monitors the room and
-       manages pause / resume / end / reset, but a detective in the room is
-       the one who starts it (POST /api/game/start). */
+       manages pause / resume / end / reset, but every detective starts
+       their OWN session (POST /api/game/start). */
     pause: ({ room }) => {
       if (room.status !== "live") throw new ApiError("NOT_LIVE", "Only a running game can be paused.");
       store.touchSession(room.id, { status: "paused" });
@@ -1130,9 +1260,19 @@ async function route(req, res, url) {
     resume: ({ room }) => {
       if (room.status !== "paused") throw new ApiError("NOT_PAUSED", "The game is not paused.");
       const now = Date.now();
-      const pausedTotal = (room.paused_total || 0) + Math.max(0, now - (room.paused_since || now));
+      const pausedMs = Math.max(0, now - (room.paused_since || now));
+      const pausedTotal = (room.paused_total || 0) + pausedMs;
       store.touchSession(room.id, { status: "live" });
-      return store.updateRoom(room.id, { status: "live", paused_since: null, paused_total: pausedTotal });
+      // Every personal clock is pushed forward by exactly the paused window,
+      // so resuming never gives anyone extra time or cuts anyone short.
+      return store.withTx(() => {
+        for (const p of store.listPlayers(room.id)) {
+          if (!p.started_at || p.status === "finished" || p.timed_out) continue;
+          if (playerRemainingMs(room, p, now) <= 0) continue; // already spent before the pause
+          store.updatePlayer(p.id, { ends_at: (p.ends_at || now) + pausedMs });
+        }
+        return store.updateRoom(room.id, { status: "live", paused_since: null, paused_total: pausedTotal });
+      });
     },
     end: ({ room }) => endRoom(room, "admin"),
     reset: ({ room }) => {

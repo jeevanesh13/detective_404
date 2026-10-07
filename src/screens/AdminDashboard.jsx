@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import Logo from "../ui/Logo.jsx";
 import Confirm from "../ui/Confirm.jsx";
 import CopyButton from "../ui/CopyButton.jsx";
-import { fmtClock, fmtElapsed, fmtDuration, remainingMs } from "../net/time.js";
+import { fmtClock, fmtElapsed, fmtDuration, roomRemainingMs } from "../net/time.js";
 
 const STATUS_LABEL = { waiting: "WAITING", live: "LIVE", paused: "PAUSED", ended: "ENDED" };
 const PLAYER_LABEL = {
@@ -13,15 +13,16 @@ const PLAYER_LABEL = {
 };
 const PRESET_MINUTES = [15, 30, 45, 60];
 
+/* Per-seat elapsed time: each detective's clock starts at THEIR START press
+   and stops at their own expiry (or when the room itself was closed). */
 function playerElapsed(p, room, serverNow) {
   if (p.timeTaken != null) return p.timeTaken;
-  if (!room?.startedAt) return 0;
-  const start = Math.max(room.startedAt, p.joinedAt || room.startedAt);
+  if (!p.startedAt) return 0;
   let end = serverNow;
-  if (room.status === "paused") end = room.pausedSince || serverNow;
-  else if (room.status === "ended") end = room.endedAt || serverNow;
-  else if (room.status === "waiting") return 0;
-  return Math.max(0, end - start);
+  if (room?.status === "paused") end = room.pausedSince || serverNow;
+  else if (room?.status === "ended") end = room.endedAt || serverNow;
+  if (p.endsAt && p.timedOut) end = Math.min(end, p.endsAt);
+  return Math.max(0, end - p.startedAt);
 }
 
 /**
@@ -75,7 +76,8 @@ export default function AdminDashboard({ game, onOpenGames }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeRoom, rooms.length]);
 
-  const remaining = remainingMs(room, serverNow);
+  /* Soonest personal clock still running (there is no shared room clock). */
+  const remaining = roomRemainingMs(room, players, serverNow);
   const online = players.filter((p) => p.online).length;
   const finished = players.filter((p) => p.status === "finished").length;
   const isCustom = !PRESET_MINUTES.includes(Number(minutes));

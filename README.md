@@ -23,10 +23,10 @@ question, image, clue, answer and point value is written by the game master in t
   publishes the game, assigns it to a room and manages the clock
   (pause / resume / end / reset). The game master **cannot start** a game.
 - **Players** join with a name + room code, see a cinematic waiting screen, and press
-  **START GAME** themselves — any detective in the room begins it, with as few as one
-  player in the room (capacity 50 is a ceiling, not a waiting list). They then play the
+  **START GAME** themselves — each detective begins their own session, with as few as one
+  player started (capacity 50 is a ceiling, not a waiting list). They then play the
   game assigned to their room: one question at a time, exactly two attempts each, against
-  a shared, server-authoritative clock.
+  their own server-authoritative clock.
 - **Live dashboard** updates over Server-Sent Events — no refresh, ever.
 
 ---
@@ -145,21 +145,25 @@ gets `409 ROOM_FULL`. See [Room capacity & concurrency](#room-capacity--concurre
    **GAME** setting → **ASSIGN**.
 3. Players open the **detective site**, type their name + code → **JOIN GAME** → waiting
    screen (`YOU ARE IN`, room code, game name, live player count, `[ WAITING ]`).
-4. Any detective presses **START GAME** on the waiting screen: the server stamps
-   `started_at` for the room, locks the duration and pushes every connected player into
-   the game in the same tick. One shared session — it starts with as few as **1** player
-   in the room; **50** is only the ceiling on how many may join. The game master has no
-   start control (the API answers `403 ADMIN_START_DISABLED`).
+4. Each detective presses **START GAME** on the waiting screen: the server stamps
+   *their* `started_at`, stores *their* expiry (`started_at + duration`) and pushes the
+   game into *their own* session only — no other player's timer or screen is touched and
+   the start is never broadcast room-wide. It works with as few as **1** player started;
+   **50** is only the ceiling on how many may join. The game master has no start control
+   (the API answers `403 ADMIN_START_DISABLED`).
 5. Each player works through the questions at their own pace. Future questions are
    locked — the server refuses answers for them, so no UI trick or URL can skip ahead.
    With **AUTO** on, the room's current case follows the leading detective.
-6. When the clock hits `00:00` the server ends the room: answers are disabled, everyone
-   sees `TIME'S UP`, final state is saved and the game master is notified.
+6. When a detective's clock hits `00:00` the server locks only *that* player: they see
+   `TIME'S UP` and the final ranking while the room — and every other detective with time
+   left — keeps playing. The room itself ends when the game master presses END, or
+   automatically once every seat has finished or run out of time.
 7. **FINAL DETECTIVE RANKING** ranks by score → questions solved → time taken.
 
-The timer is computed as `started_at + duration − now` **on the server**, then broadcast.
-Refresh, close the tab, or rejoin later and every client shows the same remaining time.
-Nothing about the clock lives in `localStorage`.
+Each timer is computed as `their started_at + duration − now` **on the server**, per
+player. Refresh, close the tab, or rejoin later and that detective continues from their
+own original start — never a fresh full timer. One detective's START never resets,
+pauses or shortens another's clock, and nothing about the clock lives in `localStorage`.
 
 ---
 
@@ -326,7 +330,7 @@ locking is enforced by the database, not by the UI.
 | POST   | `/api/heartbeat`              | token | presence / online marker                   |
 | POST   | `/api/answer`                 | token | submit answer (**server checks & scores**) |
 | POST   | `/api/next`                   | token | advance once the current question is closed |
-| POST   | `/api/game/start`             | token | **a detective starts the room's shared session** (min 1 player) |
+| POST   | `/api/game/start`             | token | **a detective starts their OWN session** (per-player start + clock) |
 | GET    | `/api/leaderboard`            | token | final ranking (only after the room ends)   |
 | GET    | `/uploads/<file>`             | —     | case images uploaded by the game master    |
 | POST   | `/api/admin/login`            | —     | game master credentials → admin token      |

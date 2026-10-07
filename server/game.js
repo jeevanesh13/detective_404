@@ -65,6 +65,43 @@ export function elapsedMs(room, now = Date.now()) {
   return Math.max(0, Math.min(room.duration, room.duration - remainingMs(room, now)));
 }
 
+/**
+ * Remaining milliseconds for ONE detective, derived purely from the
+ * timestamps the server stored when THAT detective pressed START:
+ *
+ *   playerEndTime = their started_at + the room's configured duration
+ *   remaining     = playerEndTime - currentServerTime
+ *
+ * Nothing is read from localStorage, no other player's start can move this
+ * clock, and a refresh simply recomputes it from the same stored values.
+ * While the game master has the room paused, every personal clock is frozen
+ * at the moment of the pause (and shifted forward by that window on resume).
+ */
+export function playerRemainingMs(room, player, now = Date.now()) {
+  if (!room || !player || !player.started_at) return 0;
+  if (room.status === "ended") return 0;
+  const anchor = room.status === "paused" ? room.paused_since || now : now;
+  return Math.max(0, (player.ends_at || 0) - anchor);
+}
+
+/**
+ * The countdown the game-master console shows: there is no single room clock
+ * any more, so it is the soonest personal clock still running (nobody has
+ * started yet -> the configured duration, everyone done -> 0).
+ */
+export function roomRemainingMs(room, players = [], now = Date.now()) {
+  if (!room) return 0;
+  if (room.status === "ended") return 0;
+  if (room.status === "waiting" || !room.started_at) return room.duration;
+  let min = null;
+  for (const p of players) {
+    if (!p.started_at || p.timed_out || p.status === "finished") continue;
+    const left = playerRemainingMs(room, p, now);
+    if (min === null || left < min) min = left;
+  }
+  return min === null ? 0 : min;
+}
+
 /** Ranking: score, then questions solved, then who was fastest. */
 export function rank(players) {
   return [...players].sort((a, b) => {

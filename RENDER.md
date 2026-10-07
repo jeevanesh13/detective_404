@@ -80,7 +80,7 @@ When it goes live:
    `D404_ADMIN_PASSWORD`
 3. **+ CREATE NEW ROOM** → copy the code → join from the player entrance with
    that code
-4. A detective presses **START GAME** on the player side → every screen in the room updates live (SSE) with no refresh
+4. Each detective presses **START GAME** on the player side → only they enter the case, with their own timer (full configured duration) — the game master's console updates live over SSE
 
 ## 6. Multiplayer at scale (50 in one room)
 

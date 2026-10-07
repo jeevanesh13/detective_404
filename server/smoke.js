@@ -5,6 +5,7 @@
  *
  * The suite walks the whole new product loop:
  *   Game Builder -> publish -> assign to a room -> players join ->
+ *   per-player START (independent timers, private start events) ->
  *   2 attempts per question (100 / 50 / 0) -> locked questions ->
  *   pause/resume -> final ranking -> reset -> second run.
  */
@@ -63,6 +64,8 @@ async function call(pathname, { method = "GET", body, token } = {}) {
   }
   return { status: res.status, data };
 }
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 console.log("\nDETECTIVE 404 — backend smoke test\n");
 
@@ -368,7 +371,7 @@ let tokA, tokB;
 }
 
 /* ---------------------------------------------------------------- *
- * 11. start the game
+ * 11. start the game — INDIVIDUAL, one clock per detective
  * ---------------------------------------------------------------- */
 {
   const gmAttempt = await call("/api/admin/room/start", {
@@ -380,15 +383,28 @@ let tokA, tokB;
 
   const { status, data } = await call("/api/game/start", { method: "POST", token: tokA });
   ok(status === 200 && data.room.status === "live" && data.room.startedAt > 0, "a detective starts the game");
-  ok(data.started === true, "the response confirms the room session started");
+  ok(data.started === true && data.alreadyStarted === false, "the response confirms THIS seat started");
   ok(data.players.length >= 2, "the whole room roster comes back — not just the caller");
   ok(data.room.remaining > 0 && data.room.remaining <= 45 * 60 * 1000, "countdown derives from the stored start time");
+  ok(
+    data.you.startedAt > 0 && data.you.endsAt - data.you.startedAt === 45 * 60 * 1000,
+    "the starter opens a full-length PERSONAL clock (start + duration)"
+  );
 
   const other = await call("/api/session", { token: tokB });
+  ok(other.data.room.status === "live", "the room itself reads live once anyone starts");
+  ok(!other.data.you.startedAt, "the OTHER detective is still waiting — start is individual, not room-wide");
+  ok(!other.data.you.endsAt, "no timer exists for a detective who has not pressed START");
+
+  await sleep(10);
+  const startB = await call("/api/game/start", { method: "POST", token: tokB });
+  ok(startB.status === 200 && startB.data.you.startedAt > 0, "the second detective then starts their OWN session");
   ok(
-    other.data.room.status === "live" && other.data.room.startedAt === data.room.startedAt,
-    "every other detective sees the SAME room state — one shared session"
+    startB.data.you.endsAt - startB.data.you.startedAt === 45 * 60 * 1000,
+    "their timer starts fresh from the full configured duration"
   );
+  const afterB = await call("/api/session", { token: tokA });
+  ok(afterB.data.you.endsAt === data.you.endsAt, "one detective's START never resets or touches another's timer");
 
   const jumped = await call("/api/answer", {
     method: "POST",
@@ -706,7 +722,6 @@ let secondGame;
  * progress and score. Nothing here may be satisfied by a single
  * in-memory "current player".
  * ---------------------------------------------------------------- */
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const makeRoom = async (name) => {
   const r = await call("/api/admin/rooms", { method: "POST", token: adminToken, body: { name, duration: 30 } });
   return r.data.room.roomCode;
@@ -864,11 +879,12 @@ const roomRoster = async (code) => (await call(`/api/admin/room?code=${code}`, {
 }
 
 /* ---------------------------------------------------------------- *
- * 22. START GAME belongs to the players — minimum 1, maximum 50
+ * 22. START GAME belongs to each player — INDIVIDUAL, min 1, max 50
  *
- * The room holds ONE shared game state. A detective flips it, everybody
- * in the room receives it, and the game master has no start control at
- * all. The room never waits for the capacity ceiling before starting.
+ * Every seat starts its own session: its own start timestamp, its own
+ * expiry (start + configured duration) and its own private push. The
+ * game master has no start control at all, and one detective's START
+ * is never broadcast as a "game started" to the rest of the room.
  * ---------------------------------------------------------------- */
 {
   // (a) no game assigned -> a player cannot start it either
@@ -894,7 +910,7 @@ const roomRoster = async (code) => (await call(`/api/admin/room?code=${code}`, {
       question: "Where was the key hidden?",
       questionType: "text",
       options: [],
-      correctAnswer: "Under the loose brick",
+      correctAnswer: "loose brick",
       clue: "Check behind the fireplace.",
       pointsFirst: 100,
       pointsSecond: 50,
@@ -949,23 +965,45 @@ const roomRoster = async (code) => (await call(`/api/admin/room?code=${code}`, {
   ok(pushed.includes('"status":"waiting"'), "the waiting state was pushed before the start");
 
   const started = await call("/api/game/start", { method: "POST", token: one.data.token });
-  ok(started.status === 200 && started.data.started === true, `player 1 starts the game (got ${started.status} ${started.data?.code || ""})`);
-  ok(started.data?.room?.status === "live", "the room flips to live");
+  ok(started.status === 200 && started.data.started === true, `player 1 starts their own game (got ${started.status} ${started.data?.code || ""})`);
+  ok(started.data?.room?.status === "live", "the room flips to live so the game master can monitor it");
   ok(started.data?.players?.length === 2, "the start response carries every player in the room");
+  ok(
+    started.data?.you?.startedAt > 0 && started.data?.you?.endsAt - started.data?.you?.startedAt === 60_000,
+    "player 1 receives their own start timestamp and full-length expiry"
+  );
 
-  let sawLive = pushed.includes('"status":"live"');
-  for (let i = 0; i < 8 && !sawLive; i++) {
-    await sleep(250);
-    sawLive = pushed.includes('"status":"live"');
-  }
-  ok(sawLive, "the OTHER detective is pushed GAME_STARTED without asking — one shared state");
+  // Give a (wrongly) room-wide broadcast time to arrive, then prove the
+  // OTHER detective's stream never received a game-start STATE event.
+  for (let i = 0; i < 6; i++) await sleep(250);
+  const blocks = pushed.split("\n\n").filter(Boolean);
+  const startPushedToOther = blocks.some((b) => b.startsWith("event: state") && b.includes('"status":"live"'));
+  ok(
+    !startPushedToOther,
+    "the OTHER detective is NOT pushed a game start — START is private to the seat that pressed it"
+  );
 
   const watcher = await call("/api/session", { token: two.data.token });
-  ok(watcher.data.room.status === "live", "both detectives read the same live room");
+  ok(watcher.data.room.status === "live", "the room itself reads live");
+  ok(!watcher.data.you.startedAt, "the watching detective is still WAITING — nobody started their game for them");
   ok(watcher.data.you.id === two.data.you.id, "player identity stays separate from the shared state");
 
-  const twice = await call("/api/game/start", { method: "POST", token: two.data.token });
-  ok(twice.status === 400 && twice.data.code === "ALREADY_LIVE", "a second START refuses — one session per room");
+  // The waiting detective then starts their OWN session, when they choose.
+  const startTwo = await call("/api/game/start", { method: "POST", token: two.data.token });
+  ok(
+    startTwo.status === 200 && startTwo.data.you.startedAt > 0,
+    "the second detective starts independently — a fresh personal clock"
+  );
+
+  const again = await call("/api/game/start", { method: "POST", token: two.data.token });
+  ok(
+    again.status === 200 &&
+      again.data.alreadyStarted === true &&
+      again.data.you.startedAt === startTwo.data.you.startedAt,
+    "pressing START twice never resets their own clock"
+  );
+  const firstStill = await call("/api/session", { token: one.data.token });
+  ok(firstStill.data.you.endsAt === started.data.you.endsAt, "the FIRST detective's timer is untouched by any of it");
   ac.abort();
 
   // (c) capacity and starting are independent: 50 is a ceiling, not a gate
@@ -977,6 +1015,115 @@ const roomRoster = async (code) => (await call(`/api/admin/room?code=${code}`, {
     body: { roomCode: full, playerName: "Too Late" },
   });
   ok(refused.status === 409 && refused.data.code === "ROOM_FULL", "player 51 is still refused");
+}
+
+/* ---------------------------------------------------------------- *
+ * 23. PER-PLAYER TIMERS — staggered starts, individual expiry
+ *
+ *   A presses START  -> only A has a timer (full configured duration)
+ *   (time passes)    -> A's clock runs down; B and C have NO timer
+ *   B presses START  -> B gets a FRESH full clock; A's is untouched
+ *   C presses START  -> C gets a fresh full clock; A keeps counting
+ *   A hits 00:00     -> ONLY A is locked; the room and the others play on
+ * ---------------------------------------------------------------- */
+{
+  const DURATION = 5 * 60_000;
+  const mk = await call("/api/admin/rooms", {
+    method: "POST",
+    token: adminToken,
+    body: { roomName: "Personal clocks", duration: DURATION },
+  });
+  const code = mk.data.room.roomCode;
+  ok(mk.data.room.duration === DURATION, "the configured duration is the maximum PER PLAYER");
+  const assign = await call("/api/admin/room/game", {
+    method: "POST",
+    token: adminToken,
+    body: { code, gameId: secondGame.id },
+  });
+  ok(assign.status === 200, "the published game is assigned to the timer room");
+
+  const seats = [];
+  for (const name of ["Alpha", "Bravo", "Charlie"]) {
+    const r = await call("/api/join", { method: "POST", body: { roomCode: code, playerName: name } });
+    seats.push(r.data);
+  }
+  ok(seats.every((s) => s.token), "three detectives take their seats");
+  const [tokA2, tokB2, tokC2] = seats.map((s) => s.token);
+
+  const roomId = db.prepare("SELECT id FROM rooms WHERE room_code = ?").get(code).id;
+  const alphaId = db.prepare("SELECT id FROM players WHERE room_id = ? AND player_name = 'Alpha'").get(roomId).id;
+
+  /* --- A starts: only A has a timer --- */
+  const a0 = await call("/api/game/start", { method: "POST", token: tokA2 });
+  ok(a0.status === 200 && a0.data.you.startedAt > 0, "A presses START -> A enters the game");
+  ok(a0.data.you.endsAt - a0.data.you.startedAt === DURATION, "A's timer starts at exactly the full duration");
+  const b0 = await call("/api/session", { token: tokB2 });
+  const c0 = await call("/api/session", { token: tokC2 });
+  ok(!b0.data.you.startedAt && b0.data.you.endsAt == null, "B is still waiting — no timer exists for B");
+  ok(!c0.data.you.startedAt && c0.data.you.endsAt == null, "C is still waiting — no timer exists for C");
+  ok(b0.data.room.status === "live", "the room reads live while B and C remain in the lobby");
+
+  /* --- time passes for A (two minutes of play, server-side) --- */
+  db.prepare("UPDATE players SET ends_at = ends_at - ? WHERE id = ?").run(120_000, alphaId);
+  const aMid = await call("/api/session", { token: tokA2 });
+  ok(
+    aMid.data.you.remaining > 0 && aMid.data.you.remaining <= DURATION - 120_000 + 2_000,
+    "A's clock keeps running down while nobody else has started"
+  );
+
+  /* --- B starts later: fresh full clock, A untouched --- */
+  await sleep(10);
+  const bStart = await call("/api/game/start", { method: "POST", token: tokB2 });
+  ok(bStart.status === 200 && bStart.data.you.startedAt > 0, "B presses START -> B enters the game");
+  ok(bStart.data.you.endsAt - bStart.data.you.startedAt === DURATION, "B receives a fresh full-duration timer");
+  ok(bStart.data.you.remaining > aMid.data.you.remaining, "B has more time left than A");
+  const aAfter = await call("/api/session", { token: tokA2 });
+  ok(aAfter.data.you.endsAt === aMid.data.you.endsAt, "B's START never resets or touches A's stored expiry");
+  ok(aAfter.data.you.remaining < bStart.data.you.remaining, "A keeps counting from where it was");
+  const c1 = await call("/api/session", { token: tokC2 });
+  ok(!c1.data.you.startedAt, "C is still waiting after two others started");
+
+  /* --- C starts last: its own fresh clock --- */
+  const cStart = await call("/api/game/start", { method: "POST", token: tokC2 });
+  ok(cStart.status === 200 && cStart.data.you.remaining > 0, "C presses START -> C enters the game");
+  ok(
+    cStart.data.you.endsAt >= bStart.data.you.endsAt && bStart.data.you.endsAt > aAfter.data.you.endsAt,
+    "three independent clocks: C ends last, B next, A earliest"
+  );
+
+  /* --- A runs out: ONLY A is locked --- */
+  db.prepare("UPDATE players SET ends_at = ? WHERE id = ?").run(Date.now() - 1, alphaId);
+  await sleep(1300); // the next server tick picks it up
+
+  const aEnd = await call("/api/session", { token: tokA2 });
+  ok(aEnd.data.you.timedOut === true, "A's clock hitting 00:00 marks A as time-up");
+  ok(aEnd.data.you.status === "timeout", "A's status flips to Time up");
+  ok(aEnd.data.room.status === "live", "the ROOM does not end with A — it keeps running");
+
+  const bLive = await call("/api/session", { token: tokB2 });
+  ok(!bLive.data.you.timedOut && bLive.data.you.remaining > 0, "B still has time and continues normally");
+  const cLive = await call("/api/session", { token: tokC2 });
+  ok(!cLive.data.you.timedOut && cLive.data.you.remaining > 0, "C still has time and continues normally");
+
+  const aLocked = await call("/api/answer", {
+    method: "POST",
+    token: tokA2,
+    body: { caseId: 1, answer: "loose brick" },
+  });
+  ok(aLocked.status === 400 && aLocked.data.code === "TIME_UP", "A's answers are locked at 00:00");
+
+  const bPlays = await call("/api/answer", {
+    method: "POST",
+    token: tokB2,
+    body: { caseId: 1, answer: "loose brick" },
+  });
+  ok(bPlays.status === 200 && bPlays.data.correct === true, "B keeps answering normally after A's clock ran out");
+
+  const bRefresh = await call("/api/session", { token: tokB2 });
+  ok(
+    bRefresh.data.you.endsAt === bLive.data.you.endsAt,
+    "a refresh continues the same stored clock — never a fresh one"
+  );
 }
 
 server.close();

@@ -17,6 +17,36 @@ export function elapsedMs(room, serverNow) {
   return Math.max(0, Math.min(room.duration, room.duration - remainingMs(room, serverNow)));
 }
 
+/**
+ * ONE detective's countdown, always derived from the expiry timestamp the
+ * server stored when THAT detective pressed START:
+ *
+ *   remaining = their endsAt - currentServerTime
+ *
+ * Never from localStorage, never shared with another seat — so a refresh,
+ * a new tab or another detective starting later cannot change it.
+ */
+export function playerRemainingMs(you, room, serverNow) {
+  if (!you || !you.startedAt || !you.endsAt) return 0;
+  if (room?.status === "ended") return 0;
+  const anchor = room?.status === "paused" ? room.pausedSince || serverNow : serverNow;
+  return Math.max(0, you.endsAt - anchor);
+}
+
+/**
+ * The game master's TIME REMAINING: there is no single room clock any more,
+ * so it shows the soonest personal clock still running (the configured
+ * duration before anyone starts, 0 once every clock is spent).
+ */
+export function roomRemainingMs(room, players, serverNow) {
+  if (!room) return 0;
+  if (room.status === "ended") return 0;
+  if (room.status === "waiting" || !room.startedAt) return room.duration;
+  const running = (players || []).filter((p) => p.startedAt && !p.timedOut && p.status !== "finished");
+  if (!running.length) return 0;
+  return Math.min(...running.map((p) => playerRemainingMs(p, room, serverNow)));
+}
+
 /** 45:00 — 00:00 */
 export function fmtClock(ms) {
   const total = Math.max(0, Math.ceil(ms / 1000));

@@ -3,14 +3,16 @@ import Logo from "../ui/Logo.jsx";
 import CopyButton from "../ui/CopyButton.jsx";
 import { fmtClock } from "../net/time.js";
 
-/** The lobby a detective waits in until START GAME flips the room to live. */
+/** The lobby a detective waits in until THEY press START GAME for themselves. */
 export default function WaitingScreen({ game }) {
   const { room, players, you, serverNow, leave, conn, startGame, setError } = game;
   const online = players.filter((p) => p.online).length;
   const [starting, setStarting] = useState(false);
 
-  /* Any detective in the room may start it: the room itself goes live and
-     everyone in it receives the same state. Minimum 1, maximum capacity. */
+  /* START GAME is individual: pressing it opens THIS detective's own case
+     with their own full-length timer. It never starts, resets or shortens
+     anybody else's clock — everyone else stays right here until they press
+     it themselves. Minimum 1, maximum capacity. */
   const onStart = async () => {
     if (starting) return;
     setStarting(true);
@@ -62,7 +64,7 @@ export default function WaitingScreen({ game }) {
 
           <p className="waiting-copy">
             {room?.gameId && room?.totalCases
-              ? "Ready when you are — press START GAME to begin. Every detective in the room plays together."
+              ? "Ready when you are — press START GAME to begin. Your own timer starts the moment you press it; every detective plays on their own clock."
               : "Waiting for the game master to assign a case file…"}
           </p>
 

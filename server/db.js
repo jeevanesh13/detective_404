@@ -147,6 +147,11 @@ CREATE INDEX IF NOT EXISTS idx_progress_player ON player_progress(player_id, cas
  * ------------------------------------------------------------------ */
 const columnsOf = (table) => db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
 if (!columnsOf("rooms").includes("game_id")) db.exec("ALTER TABLE rooms ADD COLUMN game_id TEXT;");
+/* One seat = one personal session: each detective stores WHEN they pressed
+   START and when THEIR clock expires. Additive only — no existing row or
+   column is touched, so every room, player and score survives the upgrade. */
+if (!columnsOf("players").includes("started_at")) db.exec("ALTER TABLE players ADD COLUMN started_at INTEGER;");
+if (!columnsOf("players").includes("ends_at")) db.exec("ALTER TABLE players ADD COLUMN ends_at INTEGER;");
 
 const metaGet = (key) => db.prepare("SELECT value FROM meta WHERE key = ?").get(key);
 const metaSet = (key, value) =>
@@ -439,7 +444,8 @@ export function resetRoomProgress(roomId) {
   db.prepare(
     `UPDATE players SET current_case = 1, completed_cases = 0, awaiting_next = 0, revealed_current = 0,
        correct_count = 0, wrong_count = 0, score = 0, status = 'playing', timed_out = 0,
-       finished_at = NULL, time_taken = NULL, case_started_at = ?, last_active = ?
+       finished_at = NULL, time_taken = NULL, case_started_at = ?, last_active = ?,
+       started_at = NULL, ends_at = NULL
      WHERE room_id = ?`
   ).run(now, now, roomId);
   db.prepare("DELETE FROM answers WHERE room_id = ?").run(roomId);
