@@ -24,7 +24,7 @@ import {
   remainingMs,
   rank,
 } from "./game.js";
-import { MAX_BODY, MAX_UPLOAD, UPLOAD_TYPES, UPLOADS_DIR, clampDuration, TICK_MS } from "./config.js";
+import { MAX_BODY, MAX_UPLOAD, UPLOAD_TYPES, UPLOADS_DIR, clampDuration, TICK_MS, MAX_PLAYERS_PER_ROOM, NAME_GRACE_MS } from "./config.js";
 import { hub } from "./hub.js";
 
 const CORS = {
@@ -315,6 +315,7 @@ function publicRoom(room, players, onlineCount) {
     caseAuto: !!room.case_auto,
     createdAt: room.created_at,
     playerCount: players.length,
+    capacity: MAX_PLAYERS_PER_ROOM,
     onlineCount,
     gameId: room.game_id || null,
     gameName: game ? game.name : null,
@@ -382,6 +383,7 @@ function roomsSummaryFor(adminId) {
       startedAt: room.started_at,
       endedAt: room.ended_at,
       players: players.length,
+      capacity: MAX_PLAYERS_PER_ROOM,
       online: online.size,
       finished: players.filter((p) => p.status === "finished").length,
       remaining: remainingMs(room),
@@ -420,6 +422,40 @@ export function endRoom(room, reason = "admin") {
     serverTime: now,
     reason,
     leaderboard: leaderboardShape(room.id),
+  });
+  return updated;
+}
+
+/**
+ * Start the room's SHARED game session.
+ *
+ * There is exactly one game state per room: whoever triggers it, every
+ * detective already in that room sees the same case, the same question list
+ * and the same countdown. Only scores, answers and progress stay per player.
+ *
+ * Minimum to start = 1 detective. Capacity is a separate ceiling
+ * (MAX_PLAYERS_PER_ROOM) — the room never waits to be full before starting.
+ */
+function startRoomSession(room) {
+  if (room.status === "live") throw new ApiError("ALREADY_LIVE", "The game is already running.");
+  if (room.status === "paused") throw new ApiError("PAUSED", "Resume the game instead.");
+  if (room.status === "ended") throw new ApiError("ENDED", "Reset the room before starting a new game.");
+  const game = gameOf(room);
+  if (!game) throw new ApiError("NO_GAME", "This room has no game yet — ask the game master to assign one.");
+  if (game.status !== "published") throw new ApiError("GAME_DRAFT", "This game is not published yet.");
+  if (!totalCasesOf(room)) throw new ApiError("GAME_EMPTY", "The assigned game has no cases yet.");
+
+  const start = Date.now();
+  let updated;
+  store.withTx(() => {
+    updated = store.updateRoom(room.id, {
+      status: "live",
+      started_at: start,
+      paused_since: null,
+      paused_total: 0,
+      ended_at: null,
+    });
+    store.touchSession(room.id, { start_time: start, end_time: null, duration: updated.duration, status: "live" });
   });
   return updated;
 }
@@ -506,24 +542,42 @@ async function route(req, res, url) {
     if (playerName.length > 24) throw new ApiError("NAME_TOO_LONG", "Detective name must be 24 characters or fewer.");
     if (!/^[A-Za-z0-9 _.'-]+$/.test(playerName))
       throw new ApiError("NAME_INVALID", "Use letters, numbers, spaces and ' . - _ only.");
-    if (!/^[A-Z0-9]{6}$/.test(roomCode)) throw new ApiError("ROOM_NOT_FOUND", "Invalid Room Code");
+    if (!/^[A-Z0-9]{6}$/.test(roomCode))
+      throw new ApiError("INVALID_ROOM_CODE", "Invalid Room Code — it is six letters or digits, e.g. ABC123.");
 
     const room = store.findRoomByCode(roomCode);
-    if (!room) throw new ApiError("ROOM_NOT_FOUND", "Invalid Room Code");
+    if (!room) throw new ApiError("ROOM_NOT_FOUND", "No room has that code. Check it with your game master.");
     if (room.status === "ended")
       throw new ApiError("ROOM_ENDED", "This investigation has already concluded. Ask the game master for a new room.");
 
     let player;
     const existing = store.findPlayerByName(room.id, playerName);
     if (existing) {
-      // Duplicate names are rejected while that detective is active. A
-      // rejoin with the same name only succeeds when the old session is
-      // gone, and it restores — never erases — their progress.
-      const busy = hub.isOnline(room.id, existing.id) || now - existing.last_active < 15_000;
+      // A returning detective takes their own seat back — the row, score and
+      // answers are restored, never erased, and nobody else's data is touched.
+      // Rejected only while that name is genuinely occupied right now.
+      const busy = hub.isOnline(room.id, existing.id) || now - existing.last_active < NAME_GRACE_MS;
       if (busy) throw new ApiError("NAME_TAKEN", "That detective name is already taken in this room.", 409);
-      player = store.updatePlayer(existing.id, { last_active: now });
+      player = store.withTx(() => store.updatePlayer(existing.id, { last_active: now }));
     } else {
-      player = store.createPlayer({ roomId: room.id, playerName });
+      // Seat + row are created in ONE transaction: the capacity check and the
+      // insert cannot be interleaved, so N simultaneous joins can never push a
+      // room past MAX_PLAYERS_PER_ROOM, and a duplicate name reports
+      // NAME_TAKEN instead of a generic server error.
+      const joined = store.joinRoomAtomic({
+        roomId: room.id,
+        playerName,
+        maxPlayers: MAX_PLAYERS_PER_ROOM,
+      });
+      if (joined.code === "ROOM_FULL")
+        throw new ApiError(
+          "ROOM_FULL",
+          `Room is full — ${joined.count} detectives are already in here (limit ${joined.capacity}). Ask the game master for a new room.`,
+          409
+        );
+      if (joined.code === "NAME_TAKEN")
+        throw new ApiError("NAME_TAKEN", "That detective name is already taken in this room.", 409);
+      player = joined.player;
     }
 
     const token = issuePlayer(player);
@@ -532,6 +586,11 @@ async function route(req, res, url) {
     online.add(player.id);
     syncRoom(room.id);
     return send(res, 200, {
+      success: true,
+      roomId: room.id,
+      roomCode: room.room_code,
+      playerId: player.id,
+      playerName: player.player_name,
       token,
       room: publicRoom(room, players, online.size),
       you: youShape(player, room, online),
@@ -645,39 +704,45 @@ async function route(req, res, url) {
     const correct = matchesAnswer(c.correct_answer, text, type);
     const points = pointsFor(c, attemptNo, correct);
     const timeTaken = Math.max(0, Date.now() - player.case_started_at);
-    store.recordAnswer({ playerId: player.id, roomId: room.id, caseId, answer: text, correct, points, timeTaken });
-
     /* Two attempts per question:
          1st correct -> full points, question closed, next one unlocked
          1st wrong    -> the configured clue, same question again
          2nd correct -> half points, question closed, next one unlocked
          2nd wrong    -> zero points, the answer is shown, question closed   */
     const closed = correct || attemptNo >= MAX_ATTEMPTS;
-    store.saveProgress({
-      playerId: player.id,
-      roomId: room.id,
-      gameId: game.id,
-      caseNumber: caseId,
-      attempts: attemptNo,
-      points: closed ? points : 0,
-      completed: closed,
-    });
 
+    /* Everything a submission changes commits as one unit: the answer row,
+       the progress row, this detective's score and the room's case pointer.
+       Fifty players answering at the same instant therefore can never leave
+       a half-written score behind, and one player's write never touches
+       another player's row (every statement is keyed by player.id). */
     let updated = player;
-    if (closed) {
-      updated = store.updatePlayer(player.id, {
-        score: player.score + points,
-        correct_count: player.correct_count + (correct ? 1 : 0),
-        wrong_count: player.wrong_count + (correct ? 0 : 1),
-        completed_cases: caseId,
-        awaiting_next: 1,
-        revealed_current: correct ? 0 : 1,
-        last_active: Date.now(),
+    store.withTx(() => {
+      store.recordAnswer({ playerId: player.id, roomId: room.id, caseId, answer: text, correct, points, timeTaken });
+      store.saveProgress({
+        playerId: player.id,
+        roomId: room.id,
+        gameId: game.id,
+        caseNumber: caseId,
+        attempts: attemptNo,
+        points: closed ? points : 0,
+        completed: closed,
       });
-      bumpRoomCase(room, caseId);
-    } else {
-      updated = store.updatePlayer(player.id, { wrong_count: player.wrong_count + 1, last_active: Date.now() });
-    }
+      if (closed) {
+        updated = store.updatePlayer(player.id, {
+          score: player.score + points,
+          correct_count: player.correct_count + (correct ? 1 : 0),
+          wrong_count: player.wrong_count + (correct ? 0 : 1),
+          completed_cases: caseId,
+          awaiting_next: 1,
+          revealed_current: correct ? 0 : 1,
+          last_active: Date.now(),
+        });
+        bumpRoomCase(room, caseId);
+      } else {
+        updated = store.updatePlayer(player.id, { wrong_count: player.wrong_count + 1, last_active: Date.now() });
+      }
+    });
 
     syncRoom(room.id);
     return send(res, 200, {
@@ -706,30 +771,33 @@ async function route(req, res, url) {
     const total = totalCasesOf(room);
     let updated;
     let finished = false;
-    if (player.current_case >= total) {
-      const finishedAt = Date.now();
-      const base = room.started_at || player.joined_at;
-      updated = store.updatePlayer(player.id, {
-        status: "finished",
-        finished_at: finishedAt,
-        time_taken: Math.max(0, finishedAt - base),
-        awaiting_next: 0,
-        completed_cases: total,
-        last_active: finishedAt,
-      });
-      finished = true;
-    } else {
-      const nextCase = player.current_case + 1;
-      updated = store.updatePlayer(player.id, {
-        current_case: nextCase,
-        completed_cases: player.current_case,
-        awaiting_next: 0,
-        revealed_current: 0,
-        case_started_at: Date.now(),
-        last_active: Date.now(),
-      });
-      bumpRoomCase(room, nextCase);
-    }
+    // Advancing the case and moving the room's pointer commit together.
+    store.withTx(() => {
+      if (player.current_case >= total) {
+        const finishedAt = Date.now();
+        const base = room.started_at || player.joined_at;
+        updated = store.updatePlayer(player.id, {
+          status: "finished",
+          finished_at: finishedAt,
+          time_taken: Math.max(0, finishedAt - base),
+          awaiting_next: 0,
+          completed_cases: total,
+          last_active: finishedAt,
+        });
+        finished = true;
+      } else {
+        const nextCase = player.current_case + 1;
+        updated = store.updatePlayer(player.id, {
+          current_case: nextCase,
+          completed_cases: player.current_case,
+          awaiting_next: 0,
+          revealed_current: 0,
+          case_started_at: Date.now(),
+          last_active: Date.now(),
+        });
+        bumpRoomCase(room, nextCase);
+      }
+    });
     syncRoom(room.id);
     return send(res, 200, {
       finished,
@@ -737,6 +805,34 @@ async function route(req, res, url) {
       you: youShape(updated, room, hub.onlineIds(room.id)),
       question: activeQuestionOf(room, updated),
       questionList: questionListOf(room, updated),
+    });
+  }
+
+  /* ---------------------------------------------------------------- *
+   * START GAME — any detective in the room can begin the session.
+   *
+   * The room has ONE shared state: this flips the room itself to live, so
+   * every player in it receives the same case, question list and countdown.
+   * It never creates a per-player game, and it needs no admin approval.
+   * A room may start with 1 detective (capacity 50 is a ceiling, not a
+   * minimum the room has to wait for).
+   * ---------------------------------------------------------------- */
+  if (path === "/api/game/start" && method === "POST") {
+    const { player, room } = requirePlayer(req, url); // session valid + room exists + this player's room
+    const seated = store.listPlayers(room.id);
+    if (!seated.length)
+      throw new ApiError("NO_PLAYERS", "At least one detective must be in the room before the game can start.");
+
+    const updated = startRoomSession(room); // one shared session for the whole room
+    const online = hub.onlineIds(updated.id);
+    syncRoom(updated.id); // push the new state to every connected player
+    return send(res, 200, {
+      started: true,
+      room: publicRoom(updated, store.listPlayers(updated.id), online.size),
+      players: store.listPlayers(updated.id).map((p) => rosterShape(p, updated, online)),
+      you: youShape(player, updated, online),
+      question: activeQuestionOf(updated, player),
+      questionList: questionListOf(updated, player),
     });
   }
 
@@ -1023,26 +1119,9 @@ async function route(req, res, url) {
   }
 
   const adminActions = {
-    start: ({ room }) => {
-      if (room.status === "live") throw new ApiError("ALREADY_LIVE", "The game is already running.");
-      if (room.status === "paused") throw new ApiError("PAUSED", "Resume the game instead.");
-      if (room.status === "ended") throw new ApiError("ENDED", "Reset the room before starting a new game.");
-      const game = gameOf(room);
-      if (!game) throw new ApiError("NO_GAME", "Assign a game to this room before starting it.");
-      if (game.status !== "published")
-        throw new ApiError("GAME_DRAFT", "Publish this game before starting the room.");
-      if (!totalCasesOf(room)) throw new ApiError("GAME_EMPTY", "The assigned game has no cases yet.");
-      const start = Date.now();
-      const updated = store.updateRoom(room.id, {
-        status: "live",
-        started_at: start,
-        paused_since: null,
-        paused_total: 0,
-        ended_at: null,
-      });
-      store.touchSession(room.id, { start_time: start, end_time: null, duration: updated.duration, status: "live" });
-      return updated;
-    },
+    /* START is deliberately absent: the game master monitors the room and
+       manages pause / resume / end / reset, but a detective in the room is
+       the one who starts it (POST /api/game/start). */
     pause: ({ room }) => {
       if (room.status !== "live") throw new ApiError("NOT_LIVE", "Only a running game can be paused.");
       store.touchSession(room.id, { status: "paused" });
@@ -1120,8 +1199,16 @@ async function route(req, res, url) {
   };
 
   const actionMatch = path.match(/^\/api\/admin\/room\/([a-z]+)$/);
-  if (actionMatch && method === "POST" && adminActions[actionMatch[1]]) {
+  if (actionMatch && method === "POST" && (actionMatch[1] === "start" || adminActions[actionMatch[1]])) {
     const body = await jsonBody(req);
+    if (actionMatch[1] === "start") {
+      // The game master never starts the game — a detective in the room does.
+      throw new ApiError(
+        "ADMIN_START_DISABLED",
+        "The game master cannot start the game. A detective in the room presses START GAME.",
+        403
+      );
+    }
     const { admin, room } = ownedRoom(req, url, body);
     const updated = await adminActions[actionMatch[1]]({ room, body, admin });
     syncRoom(room.id);
@@ -1242,6 +1329,13 @@ export async function handleRequest(req, res) {
   } catch (err) {
     if (err instanceof ApiError) {
       send(res, err.status, { code: err.code, message: err.message });
+    } else if (store.isDbError(err)) {
+      // Never leak SQL at the client: name the problem, keep the shape.
+      console.error("[deductive-404] database error:", err);
+      send(res, 500, {
+        code: "DATABASE_ERROR",
+        message: "The case file could not be updated. Please try that again.",
+      });
     } else {
       console.error("[deductive-404] request failed:", err);
       send(res, 500, { code: "SERVER_ERROR", message: "Unexpected server error." });

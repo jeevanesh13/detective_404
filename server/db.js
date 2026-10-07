@@ -11,6 +11,7 @@ export const db = new DatabaseSync(DB_FILE);
 
 db.exec(`
 PRAGMA journal_mode = WAL;
+PRAGMA busy_timeout = 5000;
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS admins (
@@ -293,6 +294,90 @@ export const findPlayerByName = (roomId, name) =>
 
 export const listPlayers = (roomId) =>
   db.prepare("SELECT * FROM players WHERE room_id = ? ORDER BY joined_at ASC").all(roomId);
+
+/** How many seats this room has already taken (a room holds many players). */
+export const countPlayers = (roomId) =>
+  db.prepare("SELECT COUNT(*) AS n FROM players WHERE room_id = ?").get(roomId).n;
+
+/* ------------------------------------------------------------------ *
+ * Transactions
+ *
+ * Node is single threaded, so one statement is already atomic — but a
+ * feature that writes several rows (join, submit answer, advance case)
+ * must not be able to half-apply. Every multi-write flow runs inside
+ * withTx(), and BEGIN IMMEDIATE takes the write lock up front so two
+ * writers (dev server + prod server, or two instances) queue instead of
+ * interleaving.
+ * ------------------------------------------------------------------ */
+let txDepth = 0;
+
+export function withTx(fn) {
+  if (txDepth > 0) {
+    // Already inside a transaction: reuse it so callers can compose.
+    txDepth += 1;
+    try {
+      return fn();
+    } finally {
+      txDepth -= 1;
+    }
+  }
+  db.exec("BEGIN IMMEDIATE");
+  txDepth = 1;
+  try {
+    const out = fn();
+    db.exec("COMMIT");
+    return out;
+  } catch (err) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      /* transaction already unwound */
+    }
+    throw err;
+  } finally {
+    txDepth = 0;
+  }
+}
+
+/** node:sqlite constraint failures (duplicate name, …) as a portable shape. */
+export function isUniqueViolation(err) {
+  if (!err) return false;
+  const code = String(err.code || "");
+  const msg = String(err.message || "");
+  return (
+    code.includes("SQLITE_CONSTRAINT") ||
+    err.errcode === 2067 ||
+    err.errcode === 1555 ||
+    /UNIQUE constraint failed/i.test(msg)
+  );
+}
+
+export function isDbError(err) {
+  if (!err) return false;
+  return isUniqueViolation(err) || String(err.code || "").startsWith("SQLITE_") || /SQLITE_/i.test(String(err.message || ""));
+}
+
+/**
+ * Atomic "count the seats, then take one".
+ *
+ * Returns { code: "OK", player } / { code: "ROOM_FULL" } / { code: "NAME_TAKEN" }
+ * instead of throwing, so the API can answer with a specific error — and two
+ * players joining at the very same instant can never exceed the capacity or
+ * collide on the same name without being told so.
+ */
+export function joinRoomAtomic({ roomId, playerName, maxPlayers }) {
+  try {
+    return withTx(() => {
+      const taken = countPlayers(roomId);
+      if (taken >= maxPlayers) return { code: "ROOM_FULL", count: taken, capacity: maxPlayers };
+      const player = createPlayer({ roomId, playerName });
+      return { code: "OK", player, count: taken + 1, capacity: maxPlayers };
+    });
+  } catch (err) {
+    if (isUniqueViolation(err)) return { code: "NAME_TAKEN" };
+    throw err;
+  }
+}
 
 export function createPlayer({ roomId, playerName }) {
   const now = Date.now();

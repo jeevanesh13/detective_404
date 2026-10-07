@@ -20,11 +20,13 @@ question, image, clue, answer and point value is written by the game master in t
 
 - **Game master** signs in on the separate admin site, presses `+ CREATE NEW GAME`, builds
   cases in the Game Editor (title, image upload, question, type, answer, clue, points),
-  publishes the game, assigns it to a room and controls the clock
-  (start / pause / resume / end / reset).
-- **Players** join with a name + room code, see a cinematic waiting screen, then play the
-  game assigned to their room: one question at a time, exactly two attempts each, against a
-  shared, server-authoritative clock.
+  publishes the game, assigns it to a room and manages the clock
+  (pause / resume / end / reset). The game master **cannot start** a game.
+- **Players** join with a name + room code, see a cinematic waiting screen, and press
+  **START GAME** themselves — any detective in the room begins it, with as few as one
+  player in the room (capacity 50 is a ceiling, not a waiting list). They then play the
+  game assigned to their room: one question at a time, exactly two attempts each, against
+  a shared, server-authoritative clock.
 - **Live dashboard** updates over Server-Sent Events — no refresh, ever.
 
 ---
@@ -118,6 +120,18 @@ on the game-master terminal.
 | `D404_DB_FILE`          | `<data>/deductive404.db`| Explicit database path                     |
 | `D404_SECRET`           | auto-generated         | HMAC signing key (falls back to `data/secret.key`) |
 
+### Room capacity
+
+| variable                     | default | purpose                                          |
+| ---------------------------- | ------- | ------------------------------------------------ |
+| `D404_MAX_PLAYERS_PER_ROOM`  | `50`    | Seats in ONE room — raise to `100`, `200`, …     |
+| `D404_NAME_GRACE_MS`         | `15000` | How long a departed detective keeps their name   |
+
+One room holds up to `D404_MAX_PLAYERS_PER_ROOM` **simultaneous** players. The limit is
+counted and enforced inside the same database transaction that inserts the player, so N
+players joining in the same instant can never push a room past the limit — the next player
+gets `409 ROOM_FULL`. See [Room capacity & concurrency](#room-capacity--concurrency).
+
 `data/` is git-ignored. Deleting it resets rooms, players and the admin password hash.
 
 ---
@@ -131,8 +145,11 @@ on the game-master terminal.
    **GAME** setting → **ASSIGN**.
 3. Players open the **detective site**, type their name + code → **JOIN GAME** → waiting
    screen (`YOU ARE IN`, room code, game name, live player count, `[ WAITING ]`).
-4. **START** locks the duration, stamps `started_at` on the server and pushes every
-   waiting player into the game in the same tick.
+4. Any detective presses **START GAME** on the waiting screen: the server stamps
+   `started_at` for the room, locks the duration and pushes every connected player into
+   the game in the same tick. One shared session — it starts with as few as **1** player
+   in the room; **50** is only the ceiling on how many may join. The game master has no
+   start control (the API answers `403 ADMIN_START_DISABLED`).
 5. Each player works through the questions at their own pace. Future questions are
    locked — the server refuses answers for them, so no UI trick or URL can skip ahead.
    With **AUTO** on, the room's current case follows the leading detective.
@@ -208,6 +225,48 @@ command. The schema is deliberately shaped like a Firestore/Supabase schema (`ro
 
 ---
 
+## Room capacity & concurrency
+
+**One room = many players.** `players.room_id` repeats — there is no uniqueness on it —
+so a room is a container for up to `D404_MAX_PLAYERS_PER_ROOM` (default **50**) separate
+detectives. Identity is always `players.id` (a UUID minted per join), never the room code:
+every row carries its own name, score, case, attempts, progress, `joined_at` and
+`last_active` heartbeat, and no code path writes "the current player" into a shared
+variable.
+
+```
+ROOM ABC123
+├── player 8f3a…  Arun     case 5  score 400  online
+├── player 1c07…  Kumar    case 5  score 350  online
+└── player 9b42…  Priya    case 4  score 300  online
+```
+
+* **Joining** — `POST /api/join` counts the seats and inserts the row inside one
+  `BEGIN IMMEDIATE … COMMIT` transaction (`joinRoomAtomic`), so 50 simultaneous joins
+  produce 50 distinct ids and player 51 is refused with `409 ROOM_FULL`. Two joins using
+  the same display name resolve to `409 NAME_TAKEN` rather than a database error.
+* **Real time** — the hub keeps `roomId → Map(connectionId → client)`, i.e. a *list* of
+  sockets per room. A new connection is added, never substituted; an event is written to
+  every socket in the room; a disconnect deletes exactly that one socket (and that
+  player's presence), leaving the room and everyone else untouched.
+* **Writes** — submissions run answer + progress + score + case pointer as a single
+  transaction, and every statement is keyed by `player.id`, so one detective's answer can
+  never touch another's row.
+* **Presence** — clients heartbeat every 20 s (`last_active`), the hub pings every 15 s,
+  and the game master sees `online` plus `last-seen` per player.
+* **Errors** — specific codes with human messages: `ROOM_NOT_FOUND`, `INVALID_ROOM_CODE`,
+  `ROOM_FULL`, `NAME_TAKEN`, `SESSION_EXPIRED`, `DATABASE_ERROR`, … never a bare
+  "Request failed".
+
+### One instance only
+
+Room membership and the live stream live in the process (in-memory hub) with SQLite on
+local disk. **Deploy exactly one instance** of the service (Render's default) and do not
+enable autoscaling — two processes would each hold their own connection list and their own
+database file. Capacity is a server-side number; the browser cannot raise it.
+
+---
+
 ## Database schema (SQLite)
 
 ```sql
@@ -236,6 +295,11 @@ uploads are stored as files under <data>/uploads/
 `rooms.game_id` is added to older databases by a guarded `ALTER TABLE` at boot — existing
 users, logins, rooms, admin accounts and settings are never touched.
 
+`players.room_id` is **not** unique: many player rows share one room (see
+[Room capacity & concurrency](#room-capacity--concurrency)). Only
+`UNIQUE(room_id, name_key)` prevents two *different* people from claiming one detective
+name in the same room.
+
 `status` on rooms: `waiting → live ⇄ paused → ended`.
 `status` on games: `draft → published`.
 Player progress (`current_case`, `score`, attempt counts, `awaiting_next`) is written on
@@ -262,13 +326,14 @@ locking is enforced by the database, not by the UI.
 | POST   | `/api/heartbeat`              | token | presence / online marker                   |
 | POST   | `/api/answer`                 | token | submit answer (**server checks & scores**) |
 | POST   | `/api/next`                   | token | advance once the current question is closed |
+| POST   | `/api/game/start`             | token | **a detective starts the room's shared session** (min 1 player) |
 | GET    | `/api/leaderboard`            | token | final ranking (only after the room ends)   |
 | GET    | `/uploads/<file>`             | —     | case images uploaded by the game master    |
 | POST   | `/api/admin/login`            | —     | game master credentials → admin token      |
 | GET    | `/api/admin/rooms`            | admin | this admin's rooms + live stats + games    |
 | POST   | `/api/admin/rooms`            | admin | create a room (auto 6-letter code)         |
 | GET    | `/api/admin/room`             | admin | full room state (players, feed, standings) |
-| POST   | `/api/admin/room/:action`     | admin | `start` `pause` `resume` `end` `reset` `case` `duration` `game` |
+| POST   | `/api/admin/room/:action`     | admin | `pause` `resume` `end` `reset` `case` `duration` `game` (`start` → 403 `ADMIN_START_DISABLED`) |
 | GET    | `/api/admin/games`            | admin | game library                               |
 | POST   | `/api/admin/games`            | admin | create a game (optional pre-created cases) |
 | GET    | `/api/admin/game?id=`         | admin | one game with its ordered cases            |

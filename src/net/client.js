@@ -131,6 +131,7 @@ export const api = {
   answer: (token, caseId, answer) =>
     call("/api/answer", { method: "POST", token, body: { caseId, answer } }),
   advance: (token) => call("/api/next", { method: "POST", token }),
+  startGame: (token) => call("/api/game/start", { method: "POST", token }),
   leaderboard: (token) => call("/api/leaderboard", { token }),
 
   adminLogin: (username, password) =>

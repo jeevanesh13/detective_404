@@ -1,11 +1,27 @@
+import { useState } from "react";
 import Logo from "../ui/Logo.jsx";
 import CopyButton from "../ui/CopyButton.jsx";
 import { fmtClock } from "../net/time.js";
 
-/** The lobby a detective waits in until the game master hits START GAME. */
+/** The lobby a detective waits in until START GAME flips the room to live. */
 export default function WaitingScreen({ game }) {
-  const { room, players, you, serverNow, leave, conn } = game;
+  const { room, players, you, serverNow, leave, conn, startGame, setError } = game;
   const online = players.filter((p) => p.online).length;
+  const [starting, setStarting] = useState(false);
+
+  /* Any detective in the room may start it: the room itself goes live and
+     everyone in it receives the same state. Minimum 1, maximum capacity. */
+  const onStart = async () => {
+    if (starting) return;
+    setStarting(true);
+    try {
+      await startGame();
+    } catch (err) {
+      setError?.(err.message);
+    } finally {
+      setStarting(false);
+    }
+  };
 
   return (
     <div className="cinema">
@@ -34,7 +50,9 @@ export default function WaitingScreen({ game }) {
             </div>
             <div className="waiting-row">
               <span>Players Joined</span>
-              <b>{players.length}</b>
+              <b>
+                {players.length} / {room?.capacity || players.length}
+              </b>
             </div>
             <div className="waiting-row">
               <span>Online now</span>
@@ -43,7 +61,9 @@ export default function WaitingScreen({ game }) {
           </div>
 
           <p className="waiting-copy">
-            Waiting for the game master to start the investigation…
+            {room?.gameId && room?.totalCases
+              ? "Ready when you are — press START GAME to begin. Every detective in the room plays together."
+              : "Waiting for the game master to assign a case file…"}
           </p>
 
           <div className="waiting-badge">
@@ -82,6 +102,9 @@ export default function WaitingScreen({ game }) {
           )}
 
           <div className="waiting-actions">
+            <button className="btn-primary" disabled={starting} onClick={onStart}>
+              {starting ? "STARTING…" : "START GAME"}
+            </button>
             <CopyButton value={room?.roomCode || ""} label="COPY ROOM CODE" />
             <button className="ghost" onClick={leave}>
               LEAVE ROOM

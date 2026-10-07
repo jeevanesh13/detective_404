@@ -138,15 +138,9 @@ export default function AdminDashboard({ game, onOpenGames }) {
         </div>
 
         <div className="controls">
-          {room.status === "waiting" && (
-            <button
-              className="btn-primary"
-              disabled={busy || !room.gameId || !room.totalCases}
-              onClick={() => run("start")}
-            >
-              START GAME
-            </button>
-          )}
+          {/* No START GAME here on purpose: a detective in the room starts the
+              session (player side). The game master monitors and can pause,
+              resume, end or reset the room. */}
           {room.status === "live" && (
             <button className="btn-warn" disabled={busy} onClick={() => run("pause")}>
               PAUSE GAME
@@ -198,7 +192,7 @@ export default function AdminDashboard({ game, onOpenGames }) {
           <p className="hint-copy start-hint">
             {room.gameId
               ? "⚠ The assigned game has no cases yet — open GAME BUILDER and add one."
-              : "⚠ This room has no game yet — choose one under GAME below and press ASSIGN, then START GAME."}
+              : "⚠ This room has no game yet — choose one under GAME below and press ASSIGN. A detective then presses START GAME."}
           </p>
         )}
 
@@ -300,7 +294,9 @@ export default function AdminDashboard({ game, onOpenGames }) {
         <div className="stat-card">
           <span>PLAYERS ONLINE</span>
           <b>{online}</b>
-          <em>of {players.length} joined</em>
+          <em>
+            {players.length} / {room.capacity || players.length} in room
+          </em>
         </div>
         <div className="stat-card">
           <span>PLAYERS FINISHED</span>
@@ -321,7 +317,9 @@ export default function AdminDashboard({ game, onOpenGames }) {
       {/* live player table + side panels */}
       <section className="cmd-columns">
         <div className="panel table-panel">
-          <div className="panel-kicker">REAL-TIME ROSTER</div>
+          <div className="panel-kicker">
+            REAL-TIME ROSTER · {players.length}/{room.capacity || players.length}
+          </div>
           <h3 className="panel-title">DETECTIVES</h3>
           {players.length === 0 ? (
             <p className="story">Nobody has entered the room yet. Share the room code above.</p>
@@ -502,8 +500,8 @@ export default function AdminDashboard({ game, onOpenGames }) {
                       <span className="room-row-name">{r.roomName}</span>
                       <span className={`st st-${r.status}`}>{STATUS_LABEL[r.status]}</span>
                       <span className="room-row-meta">
-                        {r.players} detective{r.players === 1 ? "" : "s"} · CASE {r.currentCase} ·{" "}
-                        {fmtClock(r.remaining)}
+                        {r.players}/{r.capacity || r.players} detective{r.players === 1 ? "" : "s"} · CASE{" "}
+                        {r.currentCase} · {fmtClock(r.remaining)}
                       </span>
                     </button>
                     <button

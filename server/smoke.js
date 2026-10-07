@@ -19,6 +19,7 @@ process.env.D404_ADMIN_PASSWORD = "smoke-secret";
 
 const { seedAdmin, db } = await import("./db.js");
 const { handleRequest } = await import("./api.js");
+const { MAX_PLAYERS_PER_ROOM } = await import("./config.js");
 
 let passed = 0;
 const failures = [];
@@ -139,8 +140,15 @@ let room;
   ok(!data.room.gameId, "a new room starts with no game assigned");
   room = data.room;
 
-  const noGame = await call("/api/admin/room/start", { method: "POST", token: adminToken, body: { code: room.roomCode } });
-  ok(noGame.status === 400 && noGame.data.code === "NO_GAME", "a room without a game cannot start");
+  const adminStart = await call("/api/admin/room/start", {
+    method: "POST",
+    token: adminToken,
+    body: { code: room.roomCode },
+  });
+  ok(
+    adminStart.status === 403 && adminStart.data.code === "ADMIN_START_DISABLED",
+    "the game master has no START GAME control"
+  );
 
   const draft = await call("/api/admin/room/game", {
     method: "POST",
@@ -307,7 +315,11 @@ let tokA, tokB;
   ok(missingName.status === 400 && missingName.data.code === "ROOM_NOT_FOUND", "unknown room code -> Invalid Room Code");
 
   const badCode = await call("/api/join", { method: "POST", body: { roomCode: "!!", playerName: "Arjun" } });
-  ok(badCode.status === 400 && badCode.data.code === "ROOM_NOT_FOUND", "malformed room code -> Invalid Room Code");
+  ok(
+    badCode.status === 400 && badCode.data.code === "INVALID_ROOM_CODE",
+    "malformed room code -> INVALID_ROOM_CODE"
+  );
+  ok(/six letters or digits/i.test(badCode.data.message), "the malformed-code message explains the format");
 
   const a = await call("/api/join", {
     method: "POST",
@@ -359,13 +371,24 @@ let tokA, tokB;
  * 11. start the game
  * ---------------------------------------------------------------- */
 {
-  const { status, data } = await call("/api/admin/room/start", {
+  const gmAttempt = await call("/api/admin/room/start", {
     method: "POST",
     token: adminToken,
     body: { code: room.roomCode },
   });
-  ok(status === 200 && data.room.status === "live" && data.room.startedAt > 0, "game master starts the game");
+  ok(gmAttempt.status === 403, "the admin cannot start the game even with players waiting");
+
+  const { status, data } = await call("/api/game/start", { method: "POST", token: tokA });
+  ok(status === 200 && data.room.status === "live" && data.room.startedAt > 0, "a detective starts the game");
+  ok(data.started === true, "the response confirms the room session started");
+  ok(data.players.length >= 2, "the whole room roster comes back — not just the caller");
   ok(data.room.remaining > 0 && data.room.remaining <= 45 * 60 * 1000, "countdown derives from the stored start time");
+
+  const other = await call("/api/session", { token: tokB });
+  ok(
+    other.data.room.status === "live" && other.data.room.startedAt === data.room.startedAt,
+    "every other detective sees the SAME room state — one shared session"
+  );
 
   const jumped = await call("/api/answer", {
     method: "POST",
@@ -561,7 +584,7 @@ let tokA, tokB;
     "reset clears every detective's progress"
   );
 
-  await call("/api/admin/room/start", { method: "POST", token: adminToken, body: { code: room.roomCode } });
+  await call("/api/game/start", { method: "POST", token: tokA });
   const fresh = await call("/api/answer", {
     method: "POST",
     token: tokA,
@@ -673,6 +696,287 @@ let secondGame;
 
   const again = await call(`/api/admin/rooms?code=${doomed.roomCode}`, { method: "DELETE", token: adminToken });
   ok(again.status === 404, "deleting the same room twice reports it no longer exists");
+}
+
+/* ---------------------------------------------------------------- *
+ * 21. MULTIPLAYER — ONE ROOM, MANY SIMULTANEOUS PLAYERS
+ *
+ * The heart of the product: a room is a container for up to
+ * MAX_PLAYERS_PER_ROOM detectives, each with their own id, session,
+ * progress and score. Nothing here may be satisfied by a single
+ * in-memory "current player".
+ * ---------------------------------------------------------------- */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const makeRoom = async (name) => {
+  const r = await call("/api/admin/rooms", { method: "POST", token: adminToken, body: { name, duration: 30 } });
+  return r.data.room.roomCode;
+};
+const joinMany = (code, n, prefix) =>
+  Promise.all(
+    Array.from({ length: n }, (_, i) =>
+      call("/api/join", { method: "POST", body: { roomCode: code, playerName: `${prefix} ${i + 1}` } })
+    )
+  );
+const roomRoster = async (code) => (await call(`/api/admin/room?code=${code}`, { token: adminToken })).data;
+
+{
+  ok(MAX_PLAYERS_PER_ROOM === 50, `room capacity defaults to 50 players (got ${MAX_PLAYERS_PER_ROOM})`);
+
+  /* --- 10 / 25 / 50 players joining the same room at once --- */
+  for (const n of [10, 25, 50]) {
+    const code = await makeRoom(`Load test ${n}`);
+    const res = await joinMany(code, n, `L${n}`);
+    const good = res.filter((r) => r.status === 200);
+    const ids = new Set(good.map((r) => r.data.playerId));
+
+    ok(good.length === n, `${n} simultaneous joins: all ${n} accepted`);
+    ok(ids.size === n, `${n} simultaneous joins: ${n} distinct player ids`);
+    ok(
+      good.every((r, i) => r.data.success === true && r.data.roomCode === code),
+      `${n} simultaneous joins: every response names the same room`
+    );
+
+    const list = await roomRoster(code);
+    ok(list.players.length === n, `the game master roster lists all ${n} players`);
+    ok(
+      new Set(list.players.map((p) => p.id)).size === n,
+      `no player record was overwritten by another (${n} rows, ${n} ids)`
+    );
+    ok(list.room.capacity === MAX_PLAYERS_PER_ROOM, `the room advertises capacity ${MAX_PLAYERS_PER_ROOM}`);
+    ok(
+      list.players.every((p) => typeof p.lastActive === "number"),
+      "every player carries last-seen / heartbeat information"
+    );
+  }
+
+  /* --- player 51 is rejected, and only because the room is full --- */
+  {
+    const code = await makeRoom("Capacity test");
+    const first = await joinMany(code, MAX_PLAYERS_PER_ROOM, "C");
+    ok(first.every((r) => r.status === 200), `the first ${MAX_PLAYERS_PER_ROOM} detectives are all let in`);
+
+    const extra = await call("/api/join", {
+      method: "POST",
+      body: { roomCode: code, playerName: "Detective Fifty-One" },
+    });
+    ok(extra.status === 409, "player 51 is rejected");
+    ok(extra.data.code === "ROOM_FULL", `the rejection is ROOM_FULL (got ${extra.data.code})`);
+    ok(/full/i.test(extra.data.message), "the message tells the player the room is full");
+
+    const list = await roomRoster(code);
+    ok(list.players.length === MAX_PLAYERS_PER_ROOM, "the room still holds exactly 50 players");
+
+    const rooms = await call("/api/admin/rooms", { token: adminToken });
+    const other = rooms.data.rooms.find((r) => r.players < MAX_PLAYERS_PER_ROOM);
+    const lateButOpen = await call("/api/join", {
+      method: "POST",
+      body: { roomCode: other.roomCode, playerName: "Detective Fifty-One" },
+    });
+    ok(lateButOpen.status === 200, "the same player joins a different, emptier room straight away");
+  }
+
+  /* --- two players, one display name --- */
+  {
+    const code = await makeRoom("Same name test");
+    const clashes = await Promise.all([
+      call("/api/join", { method: "POST", body: { roomCode: code, playerName: "Arun Kumar" } }),
+      call("/api/join", { method: "POST", body: { roomCode: code, playerName: "Arun Kumar" } }),
+    ]);
+    const won = clashes.filter((r) => r.status === 200);
+    const lost = clashes.filter((r) => r.status !== 200);
+    ok(won.length === 1, "exactly one of two identical names gets the seat");
+    ok(
+      lost.length === 1 && lost[0].data.code === "NAME_TAKEN",
+      `the other is told NAME_TAKEN, not a generic error (got ${lost[0]?.data?.code})`
+    );
+    ok(clashes.every((r) => r.status !== 500), "a duplicate name never produces a server error");
+
+    const list = await roomRoster(code);
+    ok(list.players.length === 1, "a name clash leaves exactly one player record");
+  }
+
+  /* --- one returning detective reclaims their own seat + progress --- */
+  {
+    const code = await makeRoom("Reconnect test");
+    const first = await call("/api/join", { method: "POST", body: { roomCode: code, playerName: "Priya" } });
+    const playerId = first.data.playerId;
+    ok(first.status === 200 && !!playerId, "a detective joins and receives a session token");
+
+    // Simulate a browser refresh / dropped network: last heartbeat ages out.
+    db.prepare("UPDATE players SET last_active = 0 WHERE id = ?").run(playerId);
+    const again = await call("/api/join", { method: "POST", body: { roomCode: code, playerName: "Priya" } });
+    ok(again.status === 200, "the same name may rejoin after the session drops");
+    ok(again.data.playerId === playerId, "rejoining restores the SAME player id — nothing is overwritten");
+    const list = await roomRoster(code);
+    ok(list.players.length === 1, "rejoining does not create a second row for one detective");
+  }
+
+  /* --- several rooms side by side, joined at the same moment --- */
+  {
+    const [a, b] = await Promise.all([makeRoom("Parallel A"), makeRoom("Parallel B")]);
+    const [ra0, rb0] = await Promise.all([joinMany(a, 5, "A"), joinMany(b, 7, "B")]);
+    const mixed = [...ra0, ...rb0];
+    ok(mixed.filter((r) => r.status === 200).length === 12, "twelve players join two rooms at the same moment");
+    const ra = await roomRoster(a);
+    const rb = await roomRoster(b);
+    ok(ra.players.length === 5 && rb.players.length === 7, "each room keeps its own roster (5 and 7)");
+    ok(
+      ra.players.every((p) => p.name.startsWith("A ")) && rb.players.every((p) => p.name.startsWith("B ")),
+      "no player leaked from one room into another"
+    );
+  }
+
+  /* --- disconnecting removes ONE player, never the room --- */
+  {
+    const code = await makeRoom("Disconnect test");
+    const res = await joinMany(code, 4, "D");
+    const tokens = res.map((r) => r.data.token);
+    ok(tokens.every(Boolean), "every player receives its own session token");
+    ok(new Set(tokens).size === 4, "session tokens are unique per player");
+
+    // Every player opens their own live stream — four sockets, one room.
+    const controllers = [];
+    for (const t of tokens) {
+      const ac = new AbortController();
+      const stream = await fetch(`${BASE}/events?room=${code}`, {
+        headers: { authorization: `Bearer ${t}`, accept: "text/event-stream" },
+        signal: ac.signal,
+      });
+      ok(stream.status === 200, "a player opens a live stream for the room");
+      controllers.push(ac);
+    }
+    await sleep(200);
+    const live = await roomRoster(code);
+    ok(live.room.onlineCount === 4, `all four streams count as online (got ${live.room.onlineCount})`);
+
+    // Detective 1 disconnects: only their socket may drop.
+    controllers[0].abort();
+    await sleep(300);
+
+    const list = await roomRoster(code);
+    ok(list.players.length === 4, "closing one connection leaves all four players in the room");
+    ok(list.room.onlineCount === 3, `exactly one player went offline (got ${list.room.onlineCount})`);
+    const others = await Promise.all(tokens.slice(1).map((t) => call("/api/session", { token: t })));
+    ok(others.every((s) => s.status === 200), "the other three sessions are untouched by that disconnect");
+    for (const ac of controllers.slice(1)) ac.abort();
+    await sleep(200);
+  }
+}
+
+/* ---------------------------------------------------------------- *
+ * 22. START GAME belongs to the players — minimum 1, maximum 50
+ *
+ * The room holds ONE shared game state. A detective flips it, everybody
+ * in the room receives it, and the game master has no start control at
+ * all. The room never waits for the capacity ceiling before starting.
+ * ---------------------------------------------------------------- */
+{
+  // (a) no game assigned -> a player cannot start it either
+  const bare = await makeRoom("Start without a game");
+  const solo = await call("/api/join", { method: "POST", body: { roomCode: bare, playerName: "Early Bird" } });
+  ok(solo.status === 200, "one detective joins a room that has no game yet");
+  const noGame = await call("/api/game/start", { method: "POST", token: solo.data.token });
+  ok(noGame.status === 400 && noGame.data.code === "NO_GAME", "a room without a game cannot start");
+
+  // (b) a real room, published game, ONE player -> enough to start
+  //     (section 21 deleted the first game and left this one with an empty
+  //     placeholder case, so complete it before publishing)
+  const detail = await call(`/api/admin/game?id=${secondGame.id}`, { token: adminToken });
+  const placeholder = detail.data.game.cases[0];
+  const filled = await call("/api/admin/game/case", {
+    method: "POST",
+    token: adminToken,
+    body: {
+      gameId: secondGame.id,
+      caseId: placeholder.id,
+      caseTitle: "The Sealed Study",
+      imageUrl: "",
+      question: "Where was the key hidden?",
+      questionType: "text",
+      options: [],
+      correctAnswer: "Under the loose brick",
+      clue: "Check behind the fireplace.",
+      pointsFirst: 100,
+      pointsSecond: 50,
+    },
+  });
+  ok(filled.status === 200, "the surviving game's placeholder case is completed");
+
+  const pub = await call("/api/admin/game/publish", {
+    method: "POST",
+    token: adminToken,
+    body: { id: secondGame.id, status: "published" },
+  });
+  ok(pub.status === 200 && pub.data.game.status === "published", "the game can be published for the start test");
+
+  const code = await makeRoom("Player start test");
+  const assign = await call("/api/admin/room/game", {
+    method: "POST",
+    token: adminToken,
+    body: { code, gameId: secondGame.id },
+  });
+  ok(assign.status === 200, `the published game is assigned to the test room (got ${assign.status} ${assign.data?.code || ""})`);
+
+  const one = await call("/api/join", { method: "POST", body: { roomCode: code, playerName: "First Detective" } });
+  ok(one.status === 200 && one.data.room.playerCount === 1, "a single detective is enough — no waiting for 50");
+
+  const gm = await call("/api/admin/room/start", { method: "POST", token: adminToken, body: { code } });
+  ok(gm.status === 403 && gm.data.code === "ADMIN_START_DISABLED", "the game master is refused with a clear code");
+
+  // Player 2 opens a live stream and just watches.
+  const two = await call("/api/join", { method: "POST", body: { roomCode: code, playerName: "Second Detective" } });
+  const ac = new AbortController();
+  const stream = await fetch(`${BASE}/events?room=${code}`, {
+    headers: { authorization: `Bearer ${two.data.token}`, accept: "text/event-stream" },
+    signal: ac.signal,
+  });
+  ok(stream.status === 200, "the second detective is connected to the room stream");
+  let pushed = "";
+  const pump = (async () => {
+    const dec = new TextDecoder();
+    const reader = stream.body.getReader();
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        pushed += dec.decode(value, { stream: true });
+      }
+    } catch {
+      /* aborted */
+    }
+  })();
+  await sleep(250);
+  ok(pushed.includes('"status":"waiting"'), "the waiting state was pushed before the start");
+
+  const started = await call("/api/game/start", { method: "POST", token: one.data.token });
+  ok(started.status === 200 && started.data.started === true, `player 1 starts the game (got ${started.status} ${started.data?.code || ""})`);
+  ok(started.data?.room?.status === "live", "the room flips to live");
+  ok(started.data?.players?.length === 2, "the start response carries every player in the room");
+
+  let sawLive = pushed.includes('"status":"live"');
+  for (let i = 0; i < 8 && !sawLive; i++) {
+    await sleep(250);
+    sawLive = pushed.includes('"status":"live"');
+  }
+  ok(sawLive, "the OTHER detective is pushed GAME_STARTED without asking — one shared state");
+
+  const watcher = await call("/api/session", { token: two.data.token });
+  ok(watcher.data.room.status === "live", "both detectives read the same live room");
+  ok(watcher.data.you.id === two.data.you.id, "player identity stays separate from the shared state");
+
+  const twice = await call("/api/game/start", { method: "POST", token: two.data.token });
+  ok(twice.status === 400 && twice.data.code === "ALREADY_LIVE", "a second START refuses — one session per room");
+  ac.abort();
+
+  // (c) capacity and starting are independent: 50 is a ceiling, not a gate
+  const full = await makeRoom("Ceiling test");
+  const seated = await joinMany(full, MAX_PLAYERS_PER_ROOM, "S");
+  ok(seated.every((r) => r.status === 200), `all ${MAX_PLAYERS_PER_ROOM} seats fill — capacity is a ceiling, not a start gate`);
+  const refused = await call("/api/join", {
+    method: "POST",
+    body: { roomCode: full, playerName: "Too Late" },
+  });
+  ok(refused.status === 409 && refused.data.code === "ROOM_FULL", "player 51 is still refused");
 }
 
 server.close();

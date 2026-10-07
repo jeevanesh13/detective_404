@@ -48,6 +48,7 @@ Render dashboard → **New → Web Service** → connect `github.com/jeevanesh13
 | `NODE_VERSION` | `24` | the backend uses `node:sqlite` (needs Node ≥ 22.13, unflagged from 24) |
 | `D404_SINGLE_PORT` | `1` | player at `/`, game master console at `/admin`, one port |
 | `D404_ADMIN_PASSWORD` | a long random string | game master passphrase — it is re-applied on **every** boot while set |
+| `D404_MAX_PLAYERS_PER_ROOM` | `50` *(optional)* | seats per room — set `100`, `200`, … to raise the limit |
 
 Env vars are also visible to the build, which is what makes the console's
 "← BACK TO PLAYER ENTRANCE" link resolve to `/` instead of a hard-coded
@@ -79,9 +80,32 @@ When it goes live:
    `D404_ADMIN_PASSWORD`
 3. **+ CREATE NEW ROOM** → copy the code → join from the player entrance with
    that code
-4. **START GAME** → the player screen updates live (SSE) with no refresh
+4. A detective presses **START GAME** on the player side → every screen in the room updates live (SSE) with no refresh
 
-## 6. Day-to-day
+## 6. Multiplayer at scale (50 in one room)
+
+Room membership and the live stream are held **in the running process** (an in-memory
+connection map) with SQLite on the mounted disk. That is exactly what makes 50 players in
+one room work — and what limits the deployment to **one instance**:
+
+| Do | Don't |
+| --- | --- |
+| Keep **1 instance** (Render's default) | Enable autoscaling / multiple instances |
+| Leave the disk mounted (`D404_DATA_DIR`) | Point two services at one SQLite file |
+| Raise capacity with `D404_MAX_PLAYERS_PER_ROOM` | Let the browser decide the player count |
+
+With one instance the flow is: `POST /api/join` counts the seats and inserts the player in
+one transaction → the socket joins that room's connection list → every player and the game
+master get the same `state` push. Player 51 receives `409 ROOM_FULL`.
+
+**Check the numbers on the live dashboard:** the roster header reads `37/50`, the
+**PLAYERS ONLINE** card reads `37 / 50 in room`, and both update in real time as players
+arrive (no reload).
+
+Render's proxy streams SSE fine — the server pings every 15 s, so the connection is never
+idle long enough to be cut.
+
+## 7. Day-to-day
 
 - **Ship an update:** `git push origin main` → Render auto-deploys. Data survives.
 - **Change the game master password:** edit `D404_ADMIN_PASSWORD` → redeploy.

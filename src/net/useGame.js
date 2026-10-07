@@ -244,6 +244,20 @@ export function useGame(activeRole = "player") {
     return data;
   }, []);
 
+  const startGame = useCallback(async () => {
+    const s = playerRef.current;
+    if (!s) throw new ApiError("UNAUTHORIZED", "Join the room first.", 401);
+    const data = await api.startGame(s.token);
+    // One shared room state: everybody in the room moves to the same case,
+    // the same question list and the same countdown.
+    if (data.room) setRoom(data.room);
+    if (data.players) setPlayers(data.players);
+    if (data.you) setYou(data.you);
+    if (data.question !== undefined) setQuestion(data.question || null);
+    if (data.questionList) setQuestionList(data.questionList);
+    return data;
+  }, []);
+
   const leave = useCallback(() => {
     if (roleRef.current === "admin") {
       clearAdmin();
@@ -504,6 +518,7 @@ export function useGame(activeRole = "player") {
     leave,
     submitAnswer,
     advance,
+    startGame,
     adminLogin,
     selectRoom,
     createRoom,

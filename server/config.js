@@ -53,6 +53,31 @@ export const UPLOAD_TYPES = {
 export const TICK_MS = 1000;
 export const HEARTBEAT_MS = 15_000;
 
+/**
+ * How many detectives may occupy ONE room at the same time.
+ *
+ * One room = many players. The count is enforced on the server, inside the
+ * same transaction that inserts the player, so two simultaneous joins can
+ * never push a room past its limit. Raise it later without touching code:
+ *
+ *   D404_MAX_PLAYERS_PER_ROOM=100   (or 200, 500, …)
+ */
+export const MAX_PLAYERS_PER_ROOM = (() => {
+  const n = Number(process.env.D404_MAX_PLAYERS_PER_ROOM);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 50;
+})();
+
+/**
+ * When a detective leaves (closed tab, lost network), their name stays
+ * reserved for this long so a reconnect cannot be stolen mid-handshake.
+ * After it expires the same name may rejoin and reclaim its own progress.
+ */
+export const NAME_GRACE_MS = (() => {
+  const n = Number(process.env.D404_NAME_GRACE_MS);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 15_000;
+})();
+
+
 /** Allowed game durations (ms) + custom upper bound. */
 export const MIN_DURATION = 60_000; // 1 minute
 export const MAX_DURATION = 6 * 60 * 60 * 1000; // 6 hours
