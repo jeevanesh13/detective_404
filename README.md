@@ -10,8 +10,9 @@ backend**:
 
 Each site has its own URL, its own HTML entry and its own bundle — the game-master console
 is not downloaded by players, and the admin session key never exists on the player origin.
-Both talk to the same API, the same Server-Sent Events stream and the same SQLite file, so
-rooms, scores and the countdown stay in lock step across the two origins.
+Both talk to the same API, the same Server-Sent Events stream and the same database — a
+local SQLite file while developing, PostgreSQL when `DATABASE_URL` is set — so rooms, scores
+and the countdown stay in lock step across the two origins.
 
 **Nothing about the game content is hard-coded.** The old built-in case file
 (`src/cases.js` and `public/images/case*.jpg`) has been removed. Every game, case,
@@ -58,7 +59,8 @@ npm run dev:admin    # game master site only (vite --config vite.admin.config.js
 ```
 
 ```bash
-npm test             # server/smoke.js — 90 end-to-end assertions against a throwaway DB
+npm test             # server/smoke.js — 227 assertions on a throw-away SQLite database
+npm run test:pg      # the same suite over the PostgreSQL SQL (in-process test engine)
 npm run build        # builds BOTH sites: dist/ (players) + dist-admin/ (game master)
 npm start            # serves both sites + API + SSE from one process
 ```
@@ -118,6 +120,7 @@ on the game-master terminal.
 | `D404_ADMIN_PASSWORD`   | `midnight-hotel`       | Game master password                       |
 | `D404_DATA_DIR`         | `./data`               | Directory for the SQLite DB + HMAC secret  |
 | `D404_DB_FILE`          | `<data>/deductive404.db`| Explicit database path                     |
+| `DATABASE_URL`          | *(unset)*              | PostgreSQL connection string — moves the whole store to PostgreSQL (see [RENDER.md](RENDER.md)) |
 | `D404_SECRET`           | auto-generated         | HMAC signing key (falls back to `data/secret.key`) |
 
 ### Room capacity
@@ -132,7 +135,10 @@ counted and enforced inside the same database transaction that inserts the playe
 players joining in the same instant can never push a room past the limit — the next player
 gets `409 ROOM_FULL`. See [Room capacity & concurrency](#room-capacity--concurrency).
 
-`data/` is git-ignored. Deleting it resets rooms, players and the admin password hash.
+`data/` is git-ignored. It is a **live database directory** — keep it out of any file-sync
+tool that watches it (OneDrive, Dropbox, …), because those tools can hold partial writes
+against an open database. Deleting it resets rooms, players and the admin password hash;
+nothing outside `data/` is ever touched.
 
 ---
 
@@ -193,19 +199,21 @@ deductive404/
 │  ├─ config.js             # env, ports, limits, upload rules
 │  ├─ dev.js                # npm run dev — boots both Vite servers in one process
 │  ├─ auth.js               # HMAC tokens (players & admins), scrypt password hashing
-│  ├─ db.js                 # node:sqlite schema + games/cases/progress queries
+│  ├─ db.js                 # async store — schema + queries, engine chosen by DATABASE_URL
+│  ├─ driver-sqlite.js       # local engine: WAL + checkpoints + backups + signal flush
+│  ├─ driver-pg.js           # PostgreSQL engine (pg pool in prod, pglite for tests)
 │  ├─ game.js               # ★ server-side answer check, scoring, timer, ranking
 │  ├─ hub.js                # SSE hub (rooms, heartbeats)
 │  ├─ api.js                # router, auth guards, admin actions, game CRUD, ticker
 │  ├─ index.js              # production server — both sites + API + SSE + uploads
 │  ├─ vite-plugin.js        # mounts the same API inside the Vite dev servers
 │  └─ smoke.js              # npm test
-└─ data/                    # git-ignored: SQLite DB, secret, uploaded case images
+└─ data/                    # git-ignored: SQLite DB + backups, secret, uploaded case images
 ```
 
 ### Why one backend, two sites
 
-`server/api.js`, the SSE hub and the SQLite file are loaded **once**. `server/dev.js`
+`server/api.js`, the SSE hub and the database engine are loaded **once**. `server/dev.js`
 creates both Vite servers with `configFile: false` and hands them the same plugin, so the
 two dev origins share one live game rather than two disconnected ones. In production a
 single `node server/index.js` binds both ports.
@@ -214,11 +222,12 @@ Each site also refuses the other's HTML entry (`/admin.html` on the player port 
 `/index.html` on the admin port return 404), so the split holds even inside the shared
 dev root.
 
-### Zero-dependency backend
+### Lean backend, own server
 
-The server uses only Node built-ins — `node:sqlite`, `node:http` and SSE — so there is no
-third-party service to sign up for, no API keys to leak, and `npm start` runs anywhere
-Node ≥ 22.13 runs.
+The local engine is pure Node built-ins — `node:sqlite`, `node:http` and SSE — so everyday
+development needs no database install, no third-party service to sign up for and no API keys
+to leak. One small runtime dependency, `pg`, is only touched in production when
+`DATABASE_URL` points at PostgreSQL. `npm start` runs anywhere Node ≥ 22.13 runs.
 
 **Why not Firestore/Supabase?** They are excellent choices, but they require credentials in
 the frontend bundle, bill per connection, and still need Cloud Functions/RLS to enforce the
@@ -264,14 +273,15 @@ ROOM ABC123
 
 ### One instance only
 
-Room membership and the live stream live in the process (in-memory hub) with SQLite on
-local disk. **Deploy exactly one instance** of the service (Render's default) and do not
-enable autoscaling — two processes would each hold their own connection list and their own
-database file. Capacity is a server-side number; the browser cannot raise it.
+Room membership and the live stream live in the process (in-memory hub); durable rows live
+in the configured database (SQLite on local disk, or PostgreSQL via `DATABASE_URL`).
+**Deploy exactly one instance** of the service (Render's default) and do not enable
+autoscaling — two processes would each hold their own connection list. Capacity is a
+server-side number; the browser cannot raise it.
 
 ---
 
-## Database schema (SQLite)
+## Database schema
 
 ```sql
 admins       (id, username UNIQUE, password_hash, created_at)
@@ -296,8 +306,10 @@ meta         (key, value)     # one-time migrations, e.g. legacy content cleared
 uploads are stored as files under <data>/uploads/
 ```
 
-`rooms.game_id` is added to older databases by a guarded `ALTER TABLE` at boot — existing
-users, logins, rooms, admin accounts and settings are never touched.
+`rooms.game_id`, `players.started_at` and `players.ends_at` are added to older databases by
+guarded boot migrations (`IF NOT EXISTS` schema + `ALTER TABLE` / `information_schema`
+checks, one additive step at a time) — existing users, logins, rooms, admin accounts and
+settings are never touched, dropped or re-created.
 
 `players.room_id` is **not** unique: many player rows share one room (see
 [Room capacity & concurrency](#room-capacity--concurrency)). Only
@@ -317,6 +329,27 @@ A player's active question is `players.current_case`; a question is unlocked whi
 `LOCKED`, and `/api/next` only advances when the current question is `awaiting_next`.
 The client never receives the text, clue or answer of a question it has not reached, so
 locking is enforced by the database, not by the UI.
+
+---
+
+## Persistence — create once, reopen tomorrow
+
+Rooms, games, cases, questions, answers, clues, point values, durations, settings and the
+admin account are stored **only** in the database — never solely in `localStorage` /
+`sessionStorage`, which vanish when the tab closes. Every create and every edit writes
+through to the database immediately.
+
+| Guarantee | How |
+| --- | --- |
+| Close tonight, reopen tomorrow | data lives in the engine, not in memory — `npm test` closes the database, reopens it and asserts every room, duration, row count, game and account is identical |
+| Survives Ctrl+C, crashes and redeploys | writes commit (`synchronous=FULL`, WAL) before the HTTP response is sent; SIGINT/SIGTERM/`exit` flush and checkpoint the WAL, and rolling `VACUUM INTO` backups are kept in `data/backups/` (five most recent) |
+| Never re-initialised on startup | `CREATE TABLE IF NOT EXISTS` plus additive, guarded column migrations only — boot never runs `DROP` / `DELETE` / re-create over an existing database |
+| Rooms are never auto-deleted | only the explicit **DELETE ROOM** button (with confirmation) removes a room — creating or preparing one just saves it |
+| Saving ≠ starting | creating a room leaves it `waiting`; the game starts only when a detective presses their own **START** |
+| Production durability | set `DATABASE_URL` and the whole store moves to PostgreSQL (see [RENDER.md](RENDER.md) §4) — with it set but unreachable the server fails fast instead of silently running on an empty local file |
+
+`npm run test:all` runs the complete suite against both engines (SQLite and the
+PostgreSQL dialect), including the close-and-reopen and killed-process restart checks.
 
 ---
 

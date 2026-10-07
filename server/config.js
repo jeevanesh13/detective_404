@@ -11,6 +11,19 @@ export const DATA_DIR = process.env.D404_DATA_DIR || path.join(ROOT, "data");
 export const DB_FILE = process.env.D404_DB_FILE || path.join(DATA_DIR, "deductive404.db");
 export const SECRET_FILE = path.join(DATA_DIR, "secret.key");
 
+/**
+ * Production database connection string.
+ *
+ *   unset          -> local SQLite file (the development default, as before)
+ *   postgres://…   -> that PostgreSQL server becomes the source of truth
+ *
+ * Set it on Render (or any host) as an environment variable — never in code.
+ * When it is set the app uses ONLY that database: it fails fast if the server
+ * is unreachable instead of quietly falling back to an empty local file.
+ * `pglite:` is a test-only in-process Postgres used by `npm run test:pg`.
+ */
+export const DATABASE_URL = process.env.DATABASE_URL || "";
+
 /** Case images uploaded from the Game Builder (never shipped with the site). */
 export const UPLOADS_DIR = path.join(DATA_DIR, "uploads");
 

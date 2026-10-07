@@ -1,6 +1,7 @@
 /**
  * End-to-end smoke test for the DETECTIVE 404 multiplayer backend.
- * Run with:  npm test
+ * Run with:  npm test            (SQLite — the local engine)
+ *      or:  npm run test:pg     (PostgreSQL SQL via the in-process test engine)
  * Uses an isolated throw-away database, so it never touches real rooms.
  *
  * The suite walks the whole new product loop:
@@ -8,17 +9,25 @@
  *   per-player START (independent timers, private start events) ->
  *   2 attempts per question (100 / 50 / 0) -> locked questions ->
  *   pause/resume -> final ranking -> reset -> second run.
+ *
+ * It ends by proving persistence: close the database, reopen it (a fresh
+ * process would do the same), and everything created is still there — rooms,
+ * games, cases, answers, scores and the admin account.
  */
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
+import { spawn } from "node:child_process";
 
+const usePg = process.argv.includes("--pg");
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "d404-test-"));
 process.env.D404_DATA_DIR = tmp;
 process.env.D404_ADMIN_PASSWORD = "smoke-secret";
+if (usePg) process.env.DATABASE_URL = "pglite:"; // must be set before db.js loads
+else delete process.env.DATABASE_URL;
 
-const { seedAdmin, db } = await import("./db.js");
+const store = await import("./db.js");
 const { handleRequest } = await import("./api.js");
 const { MAX_PLAYERS_PER_ROOM } = await import("./config.js");
 
@@ -34,7 +43,7 @@ const ok = (cond, label) => {
   }
 };
 
-seedAdmin();
+await store.seedAdmin();
 
 const server = http.createServer((req, res) => {
   handleRequest(req, res).then((handled) => {
@@ -67,7 +76,7 @@ async function call(pathname, { method = "GET", body, token } = {}) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-console.log("\nDETECTIVE 404 — backend smoke test\n");
+console.log(`\nDETECTIVE 404 — backend smoke test  ·  engine: ${store.engineLabel}\n`);
 
 /* ---------------------------------------------------------------- *
  * 1. health
@@ -674,8 +683,8 @@ let secondGame;
   const doomed = await mk("Room To Delete");
   const keeper = await mk("Room That Stays");
 
-  const doomedId = db.prepare("SELECT id FROM rooms WHERE room_code = ?").get(doomed.roomCode)?.id;
-  const keeperId = db.prepare("SELECT id FROM rooms WHERE room_code = ?").get(keeper.roomCode)?.id;
+  const doomedId = (await store.findRoomByCode(doomed.roomCode))?.id;
+  const keeperId = (await store.findRoomByCode(keeper.roomCode))?.id;
 
   const joined = await call("/api/join", {
     method: "POST",
@@ -683,8 +692,8 @@ let secondGame;
   });
   ok(joined.status === 200, "a detective can join the room that is about to be deleted");
 
-  const rows = (table) => db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE room_id = ?`).get(doomedId).n;
-  ok(rows("players") === 1, "the room holds exactly that detective before the delete");
+  const rows = await store.roomRowCounts(doomedId);
+  ok(rows.players === 1, "the room holds exactly that detective before the delete");
 
   const anon = await call(`/api/admin/rooms?code=${doomed.roomCode}`, { method: "DELETE" });
   ok(anon.status === 401, "an anonymous caller cannot delete a room");
@@ -697,18 +706,16 @@ let secondGame;
   ok(after.data.rooms.some((r) => r.roomCode === keeper.roomCode), "the other room is still in the list");
   ok(after.data.rooms.some((r) => r.roomCode === room.roomCode), "the original test room still exists");
 
+  ok(!(await store.findRoomById(doomedId)), "the room row itself is removed");
+  const afterCounts = await store.roomRowCounts(doomedId);
   ok(
-    db.prepare("SELECT COUNT(*) AS n FROM rooms WHERE id = ?").get(doomedId).n === 0,
-    "the room row itself is removed"
-  );
-  ok(
-    rows("players") === 0 &&
-      rows("answers") === 0 &&
-      rows("player_progress") === 0 &&
-      rows("game_sessions") === 0,
+    afterCounts.players === 0 &&
+      afterCounts.answers === 0 &&
+      afterCounts.player_progress === 0 &&
+      afterCounts.game_sessions === 0,
     "its players, answers, scores and session rows are removed with it"
   );
-  ok(db.prepare("SELECT COUNT(*) AS n FROM rooms WHERE id = ?").get(keeperId).n === 1, "the other room's row is intact");
+  ok(!!(await store.findRoomById(keeperId)), "the other room's row is intact");
 
   const again = await call(`/api/admin/rooms?code=${doomed.roomCode}`, { method: "DELETE", token: adminToken });
   ok(again.status === 404, "deleting the same room twice reports it no longer exists");
@@ -818,7 +825,7 @@ const roomRoster = async (code) => (await call(`/api/admin/room?code=${code}`, {
     ok(first.status === 200 && !!playerId, "a detective joins and receives a session token");
 
     // Simulate a browser refresh / dropped network: last heartbeat ages out.
-    db.prepare("UPDATE players SET last_active = 0 WHERE id = ?").run(playerId);
+    await store.updatePlayer(playerId, { last_active: 0 });
     const again = await call("/api/join", { method: "POST", body: { roomCode: code, playerName: "Priya" } });
     ok(again.status === 200, "the same name may rejoin after the session drops");
     ok(again.data.playerId === playerId, "rejoining restores the SAME player id — nothing is overwritten");
@@ -1050,8 +1057,8 @@ const roomRoster = async (code) => (await call(`/api/admin/room?code=${code}`, {
   ok(seats.every((s) => s.token), "three detectives take their seats");
   const [tokA2, tokB2, tokC2] = seats.map((s) => s.token);
 
-  const roomId = db.prepare("SELECT id FROM rooms WHERE room_code = ?").get(code).id;
-  const alphaId = db.prepare("SELECT id FROM players WHERE room_id = ? AND player_name = 'Alpha'").get(roomId).id;
+  const roomId = (await store.findRoomByCode(code)).id;
+  const alphaId = (await store.findPlayerByName(roomId, "Alpha")).id;
 
   /* --- A starts: only A has a timer --- */
   const a0 = await call("/api/game/start", { method: "POST", token: tokA2 });
@@ -1064,7 +1071,7 @@ const roomRoster = async (code) => (await call(`/api/admin/room?code=${code}`, {
   ok(b0.data.room.status === "live", "the room reads live while B and C remain in the lobby");
 
   /* --- time passes for A (two minutes of play, server-side) --- */
-  db.prepare("UPDATE players SET ends_at = ends_at - ? WHERE id = ?").run(120_000, alphaId);
+  await store.adjustPlayerEnds(alphaId, -120_000);
   const aMid = await call("/api/session", { token: tokA2 });
   ok(
     aMid.data.you.remaining > 0 && aMid.data.you.remaining <= DURATION - 120_000 + 2_000,
@@ -1092,7 +1099,7 @@ const roomRoster = async (code) => (await call(`/api/admin/room?code=${code}`, {
   );
 
   /* --- A runs out: ONLY A is locked --- */
-  db.prepare("UPDATE players SET ends_at = ? WHERE id = ?").run(Date.now() - 1, alphaId);
+  await store.setPlayerEnds(alphaId, Date.now() - 1);
   await sleep(1300); // the next server tick picks it up
 
   const aEnd = await call("/api/session", { token: tokA2 });
@@ -1126,9 +1133,169 @@ const roomRoster = async (code) => (await call(`/api/admin/room?code=${code}`, {
   );
 }
 
-server.close();
+/* ---------------------------------------------------------------- *
+ * 24. PERSISTENCE — close the database, reopen it: nothing is lost
+ *
+ * Everything the sections above created is read back after a full shutdown
+ * (flush + checkpoint + backup) — exactly what a laptop closed tonight or a
+ * server redeployed would find tomorrow. Rooms, durations, games, cases,
+ * answer rows, scores and the admin account must all be identical, and
+ * reopening must never re-run content cleanup.
+ * ---------------------------------------------------------------- */
+{
+  // Freeze the ticker first: nothing may change between snapshot and close.
+  if (globalThis.__d404Ticker) {
+    clearInterval(globalThis.__d404Ticker);
+    globalThis.__d404Ticker = null;
+  }
+  server.close();
+
+  const adminId = (await store.findAdminByName("admin")).id;
+  const snapshot = async (s) => {
+    const rooms = [];
+    for (const r of await s.listRoomsForAdmin(adminId)) {
+      rooms.push({
+        code: r.room_code,
+        name: r.room_name,
+        duration: r.duration,
+        status: r.status,
+        gameId: r.game_id,
+        ...(await s.roomRowCounts(r.id)), // players / answers / scores / sessions
+      });
+    }
+    const games = [];
+    for (const g of await s.listGames(adminId)) {
+      games.push({ name: g.name, status: g.status, cases: (await s.listCases(g.id)).length });
+    }
+    const admin = await s.findAdminByName("admin");
+    return { rooms, games, admin: admin?.username ?? null };
+  };
+
+  const before = await snapshot(store);
+  ok(before.rooms.length > 0 && before.games.length > 0, "there are real rooms and games to preserve");
+  ok(
+    before.rooms.some((r) => r.answers > 0 || r.player_progress > 0),
+    "there are recorded answers and scores to preserve"
+  );
+
+  await store.close(); // flush + checkpoint + backup, exactly like a shutdown
+
+  if (!usePg) {
+    const walPath = path.join(tmp, "deductive404.db-wal");
+    const walSize = fs.existsSync(walPath) ? fs.statSync(walPath).size : 0;
+    ok(walSize === 0, "shutdown folded every commit into the main file (the .db-wal sidecar is empty)");
+    ok(fs.statSync(path.join(tmp, "deductive404.db")).size > 0, "the main database file holds the data");
+    ok(fs.existsSync(path.join(tmp, "backups")), "shutdown left a point-in-time backup copy behind");
+  }
+
+  // A fresh module instance over the same file: what tomorrow's process sees.
+  const reopened = await import("./db.js?reopen=1");
+  const after = await snapshot(reopened);
+  ok(
+    JSON.stringify(after.rooms) === JSON.stringify(before.rooms),
+    "every room, duration, status and row count is identical after reopen"
+  );
+  ok(
+    JSON.stringify(after.games) === JSON.stringify(before.games),
+    "every game, its status and its case count are identical after reopen"
+  );
+  ok(after.admin === "admin", "the admin account still exists after reopen");
+  ok(reopened.legacyCleared === false, "reopening never re-runs content cleanup (meta flag respected)");
+  await reopened.close();
+}
+
+/* ---------------------------------------------------------------- *
+ * 25. DAY 1 → DAY 2 — a server that is killed keeps everything
+ *
+ * A child process creates ROOM001 with a published case and a 15 minute
+ * duration, then shuts down the way Ctrl+C does (flush + checkpoint + exit).
+ * A SECOND child process opens the same file "the next morning" and must
+ * find the room, the game, the case content and the admin account — with the
+ * room still "waiting", because saving a room never starts a game.
+ * (Runs on the local engine; PostgreSQL durability is the database's job.)
+ * ---------------------------------------------------------------- */
+if (!usePg) {
+  const childDir = fs.mkdtempSync(path.join(os.tmpdir(), "d404-signal-"));
+  const dbUrl = new URL("./db.js", import.meta.url).href;
+  const env = { ...process.env, D404_DATA_DIR: childDir };
+  delete env.DATABASE_URL; // this probe always runs on the local engine
+  delete env.D404_SECRET; // each child gets its own throw-away key file
+
+  const runChild = (script) =>
+    new Promise((resolve) => {
+      const child = spawn(process.execPath, ["--input-type=module", "-e", script], {
+        env,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let out = "";
+      let err = "";
+      child.stdout.on("data", (d) => (out += d));
+      child.stderr.on("data", (d) => (err += d));
+      child.on("close", (code) => resolve({ code, out, err }));
+    });
+  const lastJson = (out) => {
+    const lines = out.split("\n").map((s) => s.trim()).filter(Boolean);
+    return JSON.parse(lines[lines.length - 1]);
+  };
+
+  const created = await runChild(`
+    const store = await import(${JSON.stringify(dbUrl)});
+    await store.seedAdmin();
+    const admin = await store.findAdminByName("admin");
+    const room = await store.createRoom({ roomName: "ROOM001", duration: 15 * 60 * 1000, adminId: admin.id });
+    const game = await store.createGame({ adminId: admin.id, name: "Overnight Case", description: "built on day 1" });
+    await store.insertCase({
+      game_id: game.id, case_number: 1, case_title: "The Locked Study", image_url: "",
+      question: "Where was the spare key hidden?", question_type: "text", options: "[]",
+      correct_answer: "loose brick", clue: "Check the fireplace.",
+      points_first: 100, points_second: 50, sort_order: 0,
+    });
+    await store.updateGame(game.id, { status: "published" });
+    await store.updateRoom(room.id, { game_id: game.id, current_case: 1 });
+    console.log(JSON.stringify({ code: room.room_code, name: room.room_name, duration: room.duration }));
+    process.emit("SIGINT"); // exactly what a real Ctrl+C dispatches to listeners
+    setTimeout(() => process.exit(9), 3000); // the flush handler must exit by itself
+  `);
+  const day1 = lastJson(created.out);
+  ok(created.code === 130, `day 1: the server flushes and exits on Ctrl+C (exit code ${created.code})`);
+  const walPath = path.join(childDir, "deductive404.db-wal");
+  const walSize = fs.existsSync(walPath) ? fs.statSync(walPath).size : 0;
+  ok(walSize === 0, "day 1: shutdown checkpointed every commit into the main file (empty .db-wal)");
+  ok(day1.duration === 15 * 60 * 1000, "day 1: ROOM001 was saved with a 15 minute duration");
+
+  const morning = await runChild(`
+    const store = await import(${JSON.stringify(dbUrl)});
+    const room = await store.findRoomByCode(${JSON.stringify(day1.code)});
+    const game = room ? await store.findGame(room.game_id) : null;
+    const cases = game ? await store.listCases(game.id) : [];
+    const admin = await store.findAdminByName("admin");
+    console.log(JSON.stringify({
+      found: !!room, name: room?.room_name, duration: room?.duration, status: room?.status,
+      game: game?.name, published: game?.status,
+      caseTitle: cases[0]?.case_title, question: cases[0]?.question, answer: cases[0]?.correct_answer,
+      admin: !!admin,
+    }));
+  `);
+  ok(morning.code === 0, `day 2: a fresh process opens the same file (exit code ${morning.code})`);
+  const day2 = lastJson(morning.out);
+  ok(day2.found && day2.name === "ROOM001", "day 2: the room created last night is still there");
+  ok(day2.duration === 15 * 60 * 1000, "day 2: its 15 minute duration is unchanged");
+  ok(day2.status === "waiting", "day 2: creating/saving a room never auto-starts the game");
+  ok(
+    day2.caseTitle === "The Locked Study" &&
+      day2.question === "Where was the spare key hidden?" &&
+      day2.answer === "loose brick",
+    "day 2: the case question, answer and clue are intact"
+  );
+  ok(day2.game === "Overnight Case" && day2.published === "published", "day 2: the published game survived intact");
+  ok(day2.admin === true, "day 2: the admin account survived too");
+
+  fs.rmSync(childDir, { recursive: true, force: true });
+}
+
 try {
-  db.close();
+  server.close();
+  await store.close(); // idempotent — section 24 may already have closed it
 } catch {
   /* ignore */
 }

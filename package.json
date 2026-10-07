@@ -12,9 +12,21 @@
     "preview:admin": "vite preview --config vite.admin.config.js",
     "start": "node server/index.js",
     "server": "node server/index.js",
-    "test": "node server/smoke.js"
+    "test": "node server/smoke.js",
+    "test:pg": "node server/smoke.js --pg",
+    "test:all": "node server/smoke.js && node server/smoke.js --pg"
   },
-  "dependencies": { "react": "^18.2.0", "react-dom": "^18.2.0" },
-  "devDependencies": { "@vitejs/plugin-react": "^4.2.1", "vite": "^5.2.0" },
-  "engines": { "node": ">=22.13" }
+  "dependencies": {
+    "pg": "^8.23.1",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8",
+    "@vitejs/plugin-react": "^4.2.1",
+    "vite": "^5.2.0"
+  },
+  "engines": {
+    "node": ">=22.13"
+  }
 }

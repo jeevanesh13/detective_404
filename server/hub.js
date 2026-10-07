@@ -87,16 +87,22 @@ export const hub = {
   },
 
   broadcastRoom(roomId, event, data) {
-    for (const c of byRoom.get(roomId)?.values() || []) emit(c, event, data);
+    for (const c of [...(byRoom.get(roomId)?.values() || [])]) emit(c, event, data);
   },
 
-  /** Per-connection payload builder so players never receive private data. */
-  broadcastRoomScoped(roomId, event, build) {
-    for (const c of byRoom.get(roomId)?.values() || []) emit(c, event, build(c));
+  /**
+   * Per-connection payload builder so players never receive private data.
+   * The builder may be async — building a state snapshot reads the database —
+   * so clients are visited in order and each payload is awaited before the
+   * next one is built. The connection list is snapshotted first: a disconnect
+   * while a build is in flight must not skip the remaining sockets.
+   */
+  async broadcastRoomScoped(roomId, event, build) {
+    for (const c of [...(byRoom.get(roomId)?.values() || [])]) emit(c, event, await build(c));
   },
 
-  eachAdmin(fn) {
-    for (const c of [...admins.values()]) fn(c);
+  async eachAdmin(fn) {
+    for (const c of [...admins.values()]) await fn(c);
   },
 
   stats() {

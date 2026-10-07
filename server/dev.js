@@ -5,7 +5,8 @@
  *   Game master site http://localhost:5174/
  *
  * They are separate origins with separate HTML entries and separate bundles,
- * but they share one API + SSE hub + SQLite database, because this file loads
+ * but they share one API + SSE hub + database (local SQLite file, or
+ * PostgreSQL when DATABASE_URL is set), because this file loads
  * `server/api.js` exactly once and hands the same plugin to both Vite servers
  * (`configFile: false` so Vite cannot pull in a second copy).
  */

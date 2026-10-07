@@ -18,7 +18,9 @@ function middleware(req, res, next) {
 }
 
 export function deductiveBackend() {
-  seedAdmin();
+  // Queue the admin seed once; the store's FIFO queue guarantees it has
+  // finished before any later request reads or writes the database.
+  Promise.resolve(seedAdmin()).catch((err) => console.error("[deductive-404] admin seed failed:", err));
   return {
     name: "deductive-404-backend",
     configureServer(server) {

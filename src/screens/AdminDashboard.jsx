@@ -478,7 +478,7 @@ export default function AdminDashboard({ game, onOpenGames }) {
         <aside className="cmd-side">
           <section className="panel rooms-panel">
             <div className="panel-kicker">ROOM</div>
-            <h3 className="panel-title">ROOMS</h3>
+            <h3 className="panel-title">SAVED ROOMS</h3>
 
             <button
               className="btn-primary btn-block create-room-btn"

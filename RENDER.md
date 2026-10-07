@@ -45,16 +45,50 @@ Render dashboard → **New → Web Service** → connect `github.com/jeevanesh13
 
 | Key | Value | Why |
 | --- | --- | --- |
-| `NODE_VERSION` | `24` | the backend uses `node:sqlite` (needs Node ≥ 22.13, unflagged from 24) |
+| `NODE_VERSION` | `24` | the backend uses `node:sqlite` for the local/disk engine (needs Node ≥ 22.13, unflagged from 24) |
 | `D404_SINGLE_PORT` | `1` | player at `/`, game master console at `/admin`, one port |
 | `D404_ADMIN_PASSWORD` | a long random string | game master passphrase — it is re-applied on **every** boot while set |
+| `DATABASE_URL` | *(see §4)* | when set, the app stores everything in **PostgreSQL** instead of the SQLite file |
 | `D404_MAX_PLAYERS_PER_ROOM` | `50` *(optional)* | seats per room — set `100`, `200`, … to raise the limit |
 
 Env vars are also visible to the build, which is what makes the console's
 "← BACK TO PLAYER ENTRANCE" link resolve to `/` instead of a hard-coded
 `localhost` address.
 
+> Never hard-code a connection string or password in the code — Render injects
+> `DATABASE_URL` as an environment variable (use Render's **Secrets** for it).
+
 ## 4. Give the database a home (recommended)
+
+Everything the product remembers — rooms, room codes, games, cases, questions,
+answers, scores, durations, settings and the admin account — lives in the
+database. Pick one of the two engines:
+
+### Option A — PostgreSQL via `DATABASE_URL` *(recommended)*
+
+The production-grade choice: the data survives deploys, restarts and redeploys
+without a disk, and the database service backs it up on its own.
+
+1. Render dashboard → **New → PostgreSQL** (same region as the web service),
+   or use an external provider (Neon, Supabase, …).
+2. Copy the connection string — Render shows **Internal URL** (same-region,
+   use this) / **External URL** (other providers).
+3. Add it to the web service as the environment variable **`DATABASE_URL`** and
+   redeploy.
+
+On first boot the server creates its schema in that database, and later boots
+only ever run **additive** column checks — it never drops, resets or deletes
+anything, and it refuses to start if `DATABASE_URL` is set but unreachable
+(it will **not** silently fall back to an empty local file).
+
+A connection string containing `sslmode=require` (Render's default) connects
+over TLS.
+
+> **You still want a Disk for Option A too** — `secret.key` (session signing)
+> and `data/uploads/` (case images) are files, not rows: mount `/var/data`,
+> set `D404_DATA_DIR=/var/data`. Database rows are unaffected by the disk.
+
+### Option B — SQLite on a Render Disk (no database service)
 
 SQLite lives on disk, and Render wipes the filesystem on every deploy unless you
 attach a **Disk**.
@@ -66,9 +100,14 @@ attach a **Disk**.
 That disk now holds everything that matters: `deductive404.db` (rooms, players,
 answers, scores), `secret.key` and `data/uploads/` (case images).
 
-> **Without a disk** (free plan) the app still runs, but rooms, scores and
-> uploaded images are reset on every deploy/restart. Fine for a demo, not for a
-> real event.
+The file engine is durability-hardened: WAL mode with `synchronous=FULL`, a
+checkpoint that folds the WAL into the main file every 30 seconds **and** on
+shutdown, plus rolling backups in `data/backups/` (the five most recent are
+kept).
+
+> **Without a disk** (free plan, no `DATABASE_URL`) the app still runs, but
+> rooms, scores and uploaded images are reset on every deploy/restart. Fine
+> for a demo, not for a real event.
 
 ## 5. Deploy and check it
 
@@ -85,13 +124,14 @@ When it goes live:
 ## 6. Multiplayer at scale (50 in one room)
 
 Room membership and the live stream are held **in the running process** (an in-memory
-connection map) with SQLite on the mounted disk. That is exactly what makes 50 players in
+connection map); every durable row lives in the configured database (PostgreSQL via
+`DATABASE_URL`, or the SQLite file on the mounted disk). That is exactly what makes 50 players in
 one room work — and what limits the deployment to **one instance**:
 
 | Do | Don't |
 | --- | --- |
 | Keep **1 instance** (Render's default) | Enable autoscaling / multiple instances |
-| Leave the disk mounted (`D404_DATA_DIR`) | Point two services at one SQLite file |
+| Leave the disk mounted (`D404_DATA_DIR`) | Point two services at one database |
 | Raise capacity with `D404_MAX_PLAYERS_PER_ROOM` | Let the browser decide the player count |
 
 With one instance the flow is: `POST /api/join` counts the seats and inserts the player in
@@ -113,7 +153,8 @@ idle long enough to be cut.
   instance (Starter) stays awake — use one for a live session.
 - **Existing local content:** `data/` is gitignored, so your local rooms and games
   are **not** on Render. Re-create them in the Game Builder after the first deploy
-  (takes a minute), or copy `data/deductive404.db` onto the disk.
+  (takes a minute). With Option B you can instead copy `data/deductive404.db` onto
+  the disk; with Option A the database starts empty by design.
 - **Local development is untouched:** `npm run dev` → 5173/5174, `npm start` →
   5175/5176.
 
@@ -122,7 +163,8 @@ idle long enough to be cut.
 | Symptom | Fix |
 | --- | --- |
 | "no available port" / process exits instantly | `D404_SINGLE_PORT=1` is missing |
+| Process exits at boot right after setting `DATABASE_URL` | the database is unreachable or the URL/`sslmode` is wrong — the app fails fast instead of silently running on an empty local file |
 | Game master link points at localhost | the env var was added *after* a build → redeploy so it is inlined |
-| Rooms vanish on deploy | the disk is missing or `D404_DATA_DIR` doesn't match its mount path |
+| Rooms vanish on deploy | SQLite mode: the disk is missing or `D404_DATA_DIR` doesn't match its mount path — or no `DATABASE_URL` and no disk at all (see §4) |
 | Login refused after a redeploy | `D404_ADMIN_PASSWORD` was changed — it rotates on every boot |
 | 404 on the console assets | you're on `/admin.html` of an old build → open `/admin` |

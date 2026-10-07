@@ -5,16 +5,17 @@
  *   http://localhost:5175/   detective site   (dist/)
  *   http://localhost:5176/   game master site (dist-admin/)
  *
- * Both listeners share the same API, SSE hub and SQLite database, so every
- * room, player and countdown stays in sync across the two origins.
+ * Both listeners share the same API, SSE hub and database — the local SQLite
+ * file by default, PostgreSQL when DATABASE_URL is set (see RENDER.md) — so
+ * every room, player and countdown stays in sync across the two origins.
  *
  *   npm install && npm run build && npm start
  */
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
-import { PORT, ADMIN_PORT, HOST, ROOT, DATA_DIR, ADMIN_USER, DIST_DIR, ADMIN_DIST_DIR } from "./config.js";
-import { seedAdmin } from "./db.js";
+import { PORT, ADMIN_PORT, HOST, ADMIN_USER, DIST_DIR, ADMIN_DIST_DIR } from "./config.js";
+import { seedAdmin, engineLabel } from "./db.js";
 import { handleRequest } from "./api.js";
 
 const MIME = {
@@ -87,7 +88,7 @@ function serveStatic(req, res, site) {
   res.end(body);
 }
 
-const adminState = seedAdmin();
+const adminState = await seedAdmin();
 
 /**
  * Single-port mode — for hosts that publish exactly one port (Render, Railway,
@@ -154,7 +155,7 @@ for (const { site, server } of servers) {
         ? `   Game master console: http://localhost:${PORT}/admin   (single-port mode)`
         : `   Game master console: http://localhost:${ADMIN_PORT}/`
     );
-    console.log(`   Database           : ${path.relative(ROOT, path.join(DATA_DIR, "deductive404.db"))}`);
+    console.log(`   Database           : ${engineLabel}`);
     console.log(`   Admin account      : ${ADMIN_USER} (${adminState}) · password from D404_ADMIN_PASSWORD`);
     console.log("");
   });
