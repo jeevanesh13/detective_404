@@ -48,7 +48,8 @@ Render dashboard → **New → Web Service** → connect `github.com/jeevanesh13
 | `NODE_VERSION` | `24` | the backend uses `node:sqlite` for the local/disk engine (needs Node ≥ 22.13, unflagged from 24) |
 | `D404_SINGLE_PORT` | `1` | player at `/`, game master console at `/admin`, one port |
 | `D404_ADMIN_PASSWORD` | a long random string | game master passphrase — it is re-applied on **every** boot while set |
-| `DATABASE_URL` | *(see §4)* | when set, the app stores everything in **PostgreSQL** instead of the SQLite file |
+| `MONGODB_URI` | *(see §4A)* | **MongoDB Atlas — the recommended production database**: every game, room, answer and timer persists across restarts, sleeps and redeploys |
+| `DATABASE_URL` | *(see §4B)* | alternative SQL engine — stores everything in **PostgreSQL** instead of the SQLite file |
 | `D404_MAX_PLAYERS_PER_ROOM` | `50` *(optional)* | seats per room — set `100`, `200`, … to raise the limit |
 
 Env vars are also visible to the build, which is what makes the console's
@@ -56,18 +57,69 @@ Env vars are also visible to the build, which is what makes the console's
 `localhost` address.
 
 > Never hard-code a connection string or password in the code — Render injects
-> `DATABASE_URL` as an environment variable (use Render's **Secrets** for it).
+> `MONGODB_URI` / `DATABASE_URL` as environment variables (use Render's
+> **Secrets** for them). They are read server-side only: the connection string
+> is never bundled into the frontend, never returned by an API and never
+> written to a log (only host + database name ever appear).
 
 ## 4. Give the database a home (recommended)
 
 Everything the product remembers — rooms, room codes, games, cases, questions,
 answers, scores, durations, settings and the admin account — lives in the
-database. Pick one of the two engines:
+database. Pick one of the engines:
 
-### Option A — PostgreSQL via `DATABASE_URL` *(recommended)*
+### Option A — MongoDB Atlas *(recommended)*
 
-The production-grade choice: the data survives deploys, restarts and redeploys
-without a disk, and the database service backs it up on its own.
+The permanent, zero-disk database: games and rooms survive server restarts,
+sleep/wake cycles, crashes and redeploys, because nothing you save lives in the
+process — it is written straight to Atlas and read back on load.
+
+**Create the free (M0) cluster — about five minutes:**
+
+1. Sign in at <https://cloud.mongodb.com> → **Database → Create a cluster**.
+2. Choose the free **M0** tier, any region close to your Render service,
+   defaults everywhere else → **Create**.
+3. Under **Database → Access Manager (or Database Access)** → **Add New
+   Database User**: authentication method *Password*, pick a username and a
+   strong password (these live only in the connection string) → add role
+   **`readWriteAnyDatabase`** → **Add User**.
+4. Under **Network Access → IP Access List** → **Add IP Address** →
+   **Allow Access from Anywhere** (`0.0.0.0/0`). (Render's outbound IPs are
+   dynamic; Atlas free tier has no private-link option on M0.)
+5. **Database → Connect → Drivers** → keep *Node* / latest version → copy the
+   connection string it shows, e.g.
+   `mongodb+srv://user:pass@cluster0.xxxxx.mongodb.net/` — replace
+   `<password>` with the real password, and (optionally) set the trailing path
+   to your database name, e.g. `...mongodb.net/deductive404`.
+6. In Render → your service → **Environment** → add a **Secret**:
+   `MONGODB_URI` = that string → **Save** → redeploy.
+
+**On first boot the server:**
+
+- connects with one reused pool (no new connection per request),
+- creates its indexes idempotently — it never drops, truncates or resets a
+  collection, and it refuses to start if `MONGODB_URI` is set but unreachable
+  (it will **not** pretend a save succeeded),
+- **imports your local `data/deductive404.db` automatically** if the Atlas
+  database is still empty and the file exists on the machine (flag-guarded and
+  run once — see §7),
+- writes every subsequent SAVE immediately to MongoDB.
+
+**Verify the persistence test yourself:** SAVE a game → stop the server (or
+let Render redeploy) → start it again → open the Game Builder: the same game,
+cases, images, clues and *Updated* timestamp are still there. On Render you
+can also use **Manual Deploy → Clear build cache & deploy** — data is in
+Atlas, not on the instance.
+
+> **You still want a Disk with Option A** — `secret.key` (session signing) and
+> `data/uploads/` (case image files) are files, not rows: mount `/var/data`,
+> set `D404_DATA_DIR=/var/data`. Case *image URLs* are stored in MongoDB; the
+> image bytes live in that folder.
+
+### Option B — PostgreSQL via `DATABASE_URL`
+
+The SQL production-grade choice: the data survives deploys, restarts and
+redeploys without a disk, and the database service backs it up on its own.
 
 1. Render dashboard → **New → PostgreSQL** (same region as the web service),
    or use an external provider (Neon, Supabase, …).
@@ -84,11 +136,11 @@ anything, and it refuses to start if `DATABASE_URL` is set but unreachable
 A connection string containing `sslmode=require` (Render's default) connects
 over TLS.
 
-> **You still want a Disk for Option A too** — `secret.key` (session signing)
+> **You still want a Disk for Option B too** — `secret.key` (session signing)
 > and `data/uploads/` (case images) are files, not rows: mount `/var/data`,
 > set `D404_DATA_DIR=/var/data`. Database rows are unaffected by the disk.
 
-### Option B — SQLite on a Render Disk (no database service)
+### Option C — SQLite on a Render Disk (no database service)
 
 SQLite lives on disk, and Render wipes the filesystem on every deploy unless you
 attach a **Disk**.
@@ -105,9 +157,9 @@ checkpoint that folds the WAL into the main file every 30 seconds **and** on
 shutdown, plus rolling backups in `data/backups/` (the five most recent are
 kept).
 
-> **Without a disk** (free plan, no `DATABASE_URL`) the app still runs, but
-> rooms, scores and uploaded images are reset on every deploy/restart. Fine
-> for a demo, not for a real event.
+> **Without a disk** (free plan, no `MONGODB_URI`, no `DATABASE_URL`) the app
+> still runs, but rooms, scores and uploaded images are reset on every
+> deploy/restart. Fine for a demo, not for a real event.
 
 ## 5. Deploy and check it
 
@@ -124,8 +176,9 @@ When it goes live:
 ## 6. Multiplayer at scale (50 in one room)
 
 Room membership and the live stream are held **in the running process** (an in-memory
-connection map); every durable row lives in the configured database (PostgreSQL via
-`DATABASE_URL`, or the SQLite file on the mounted disk). That is exactly what makes 50 players in
+connection map); every durable row lives in the configured database (MongoDB Atlas via
+`MONGODB_URI`, PostgreSQL via `DATABASE_URL`, or the SQLite file on the mounted disk).
+That is exactly what makes 50 players in
 one room work — and what limits the deployment to **one instance**:
 
 | Do | Don't |
@@ -152,9 +205,13 @@ idle long enough to be cut.
 - **Sleeping:** the free plan sleeps after ~7 days idle (≈50 s cold start). A paid
   instance (Starter) stays awake — use one for a live session.
 - **Existing local content:** `data/` is gitignored, so your local rooms and games
-  are **not** on Render. Re-create them in the Game Builder after the first deploy
-  (takes a minute). With Option B you can instead copy `data/deductive404.db` onto
-  the disk; with Option A the database starts empty by design.
+  are **not** on Render — but **with Option A they arrive on their own**: if the
+  Atlas database is still empty when the server boots and `data/deductive404.db`
+  happens to be present on the machine, every game, room, player and answer is
+  imported once (flag-guarded, resumable, never overwrites existing documents).
+  Easiest of all: build the games once in the Game Builder on Render — everything
+  is then stored in MongoDB permanently. With Option C you can instead copy
+  `data/deductive404.db` onto the disk; Option B starts empty by design.
 - **Local development is untouched:** `npm run dev` → 5173/5174, `npm start` →
   5175/5176.
 
@@ -163,8 +220,10 @@ idle long enough to be cut.
 | Symptom | Fix |
 | --- | --- |
 | "no available port" / process exits instantly | `D404_SINGLE_PORT=1` is missing |
+| Process exits at boot right after setting `MONGODB_URI` | Atlas is unreachable from the build/boot, the URI is wrong, or the database user/IP list isn't set up (§4A steps 3–4) — the app fails fast instead of ever reporting a false "saved" |
+| A save fails with a database error in the logs | the log line tells you the operation — check Atlas **Monitoring/Logs**; credentials are never printed (only host + database name) |
 | Process exits at boot right after setting `DATABASE_URL` | the database is unreachable or the URL/`sslmode` is wrong — the app fails fast instead of silently running on an empty local file |
 | Game master link points at localhost | the env var was added *after* a build → redeploy so it is inlined |
-| Rooms vanish on deploy | SQLite mode: the disk is missing or `D404_DATA_DIR` doesn't match its mount path — or no `DATABASE_URL` and no disk at all (see §4) |
+| Rooms vanish on deploy | `MONGODB_URI` missing (data is then only in the local file) → set it (§4A); SQLite mode: the disk is missing or `D404_DATA_DIR` doesn't match its mount path — or no engine/disk at all (see §4) |
 | Login refused after a redeploy | `D404_ADMIN_PASSWORD` was changed — it rotates on every boot |
 | 404 on the console assets | you're on `/admin.html` of an old build → open `/admin` |

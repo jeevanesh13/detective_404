@@ -2,6 +2,9 @@
  * End-to-end smoke test for the DETECTIVE 404 multiplayer backend.
  * Run with:  npm test            (SQLite — the local engine)
  *      or:  npm run test:pg     (PostgreSQL SQL via the in-process test engine)
+ *      or:  npm run test:mongo  (MongoDB — in-process throw-away server, or
+ *                                D404_MONGO_TEST_URI for a cluster; always uses
+ *                                the d404-test database)
  * Uses an isolated throw-away database, so it never touches real rooms.
  *
  * The suite walks the whole new product loop:
@@ -21,11 +24,32 @@ import http from "node:http";
 import { spawn } from "node:child_process";
 
 const usePg = process.argv.includes("--pg");
+const useMongo = process.argv.includes("--mongo");
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "d404-test-"));
 process.env.D404_DATA_DIR = tmp;
 process.env.D404_ADMIN_PASSWORD = "smoke-secret";
-if (usePg) process.env.DATABASE_URL = "pglite:"; // must be set before db.js loads
-else delete process.env.DATABASE_URL;
+
+/** Throw-away MongoDB for this run (set before db.js loads, see config.js). */
+let memoryServer = null;
+if (useMongo) {
+  if (process.env.D404_MONGO_TEST_URI) {
+    process.env.MONGODB_URI = process.env.D404_MONGO_TEST_URI;
+  } else {
+    // A single-node replica set, like Atlas free tier — so the run exercises
+    // the same multi-document transaction path production uses.
+    const { MongoMemoryReplSet } = await import("mongodb-memory-server");
+    memoryServer = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
+    process.env.MONGODB_URI = memoryServer.getUri();
+  }
+  process.env.D404_MONGODB_DB = "d404-test"; // never a real database
+  delete process.env.DATABASE_URL;
+} else if (usePg) {
+  process.env.DATABASE_URL = "pglite:"; // must be set before db.js loads
+  delete process.env.MONGODB_URI; // an ambient Atlas URI must not hijack this run
+} else {
+  delete process.env.DATABASE_URL;
+  delete process.env.MONGODB_URI;
+}
 
 const store = await import("./db.js");
 const { handleRequest } = await import("./api.js");
@@ -1180,7 +1204,7 @@ const roomRoster = async (code) => (await call(`/api/admin/room?code=${code}`, {
 
   await store.close(); // flush + checkpoint + backup, exactly like a shutdown
 
-  if (!usePg) {
+  if (store.engine === "sqlite") {
     const walPath = path.join(tmp, "deductive404.db-wal");
     const walSize = fs.existsSync(walPath) ? fs.statSync(walPath).size : 0;
     ok(walSize === 0, "shutdown folded every commit into the main file (the .db-wal sidecar is empty)");
@@ -1212,13 +1236,13 @@ const roomRoster = async (code) => (await call(`/api/admin/room?code=${code}`, {
  * A SECOND child process opens the same file "the next morning" and must
  * find the room, the game, the case content and the admin account — with the
  * room still "waiting", because saving a room never starts a game.
- * (Runs on the local engine; PostgreSQL durability is the database's job.)
+ * (Runs on SQLite and MongoDB; PostgreSQL durability is the database's job.)
  * ---------------------------------------------------------------- */
-if (!usePg) {
+if (store.engine !== "postgres") {
   const childDir = fs.mkdtempSync(path.join(os.tmpdir(), "d404-signal-"));
   const dbUrl = new URL("./db.js", import.meta.url).href;
   const env = { ...process.env, D404_DATA_DIR: childDir };
-  delete env.DATABASE_URL; // this probe always runs on the local engine
+  delete env.DATABASE_URL; // local engine probe — never the pg connection
   delete env.D404_SECRET; // each child gets its own throw-away key file
 
   const runChild = (script) =>
@@ -1253,14 +1277,21 @@ if (!usePg) {
     await store.updateGame(game.id, { status: "published" });
     await store.updateRoom(room.id, { game_id: game.id, current_case: 1 });
     console.log(JSON.stringify({ code: room.room_code, name: room.room_name, duration: room.duration }));
+    if (store.engine === "mongodb") {
+      // Clean shutdown: drain + close the pooled client, exit like Ctrl+C.
+      await store.close();
+      process.exit(130);
+    }
     process.emit("SIGINT"); // exactly what a real Ctrl+C dispatches to listeners
     setTimeout(() => process.exit(9), 3000); // the flush handler must exit by itself
   `);
   const day1 = lastJson(created.out);
   ok(created.code === 130, `day 1: the server flushes and exits on Ctrl+C (exit code ${created.code})`);
-  const walPath = path.join(childDir, "deductive404.db-wal");
-  const walSize = fs.existsSync(walPath) ? fs.statSync(walPath).size : 0;
-  ok(walSize === 0, "day 1: shutdown checkpointed every commit into the main file (empty .db-wal)");
+  if (store.engine === "sqlite") {
+    const walPath = path.join(childDir, "deductive404.db-wal");
+    const walSize = fs.existsSync(walPath) ? fs.statSync(walPath).size : 0;
+    ok(walSize === 0, "day 1: shutdown checkpointed every commit into the main file (empty .db-wal)");
+  }
   ok(day1.duration === 15 * 60 * 1000, "day 1: ROOM001 was saved with a 15 minute duration");
 
   const morning = await runChild(`
@@ -1275,6 +1306,12 @@ if (!usePg) {
       caseTitle: cases[0]?.case_title, question: cases[0]?.question, answer: cases[0]?.correct_answer,
       admin: !!admin,
     }));
+    if (store.engine === "mongodb") {
+      // tidy the shared throw-away database, then release the pooled client
+      if (room) await store.deleteRoom(room.id);
+      if (game) await store.deleteGame(game.id);
+      await store.close();
+    }
   `);
   ok(morning.code === 0, `day 2: a fresh process opens the same file (exit code ${morning.code})`);
   const day2 = lastJson(morning.out);
@@ -1298,6 +1335,11 @@ try {
   await store.close(); // idempotent — section 24 may already have closed it
 } catch {
   /* ignore */
+}
+try {
+  if (memoryServer) await memoryServer.stop();
+} catch {
+  /* throw-away server is best effort */
 }
 try {
   fs.rmSync(tmp, { recursive: true, force: true });

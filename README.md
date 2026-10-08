@@ -11,7 +11,8 @@ backend**:
 Each site has its own URL, its own HTML entry and its own bundle — the game-master console
 is not downloaded by players, and the admin session key never exists on the player origin.
 Both talk to the same API, the same Server-Sent Events stream and the same database — a
-local SQLite file while developing, PostgreSQL when `DATABASE_URL` is set — so rooms, scores
+local SQLite file while developing, **MongoDB Atlas** when `MONGODB_URI` is set (the
+production source of truth), PostgreSQL when `DATABASE_URL` is set — so rooms, scores
 and the countdown stay in lock step across the two origins.
 
 **Nothing about the game content is hard-coded.** The old built-in case file
@@ -116,12 +117,19 @@ on the game-master terminal.
 
 | variable                | default                | purpose                                   |
 | ----------------------- | ---------------------- | ----------------------------------------- |
+| `MONGODB_URI`           | *(unset)*              | **MongoDB Atlas connection string — every game, room, answer and timer lives in MongoDB** (see [RENDER.md](RENDER.md) §4A). Wins over `DATABASE_URL`; never sent to the browser and never logged (see `.env.example`) |
+| `D404_MONGODB_DB`       | URI path or `deductive404` | Database name inside the Atlas cluster |
 | `D404_ADMIN_USER`       | `admin`                | Game master username                       |
 | `D404_ADMIN_PASSWORD`   | `midnight-hotel`       | Game master password                       |
 | `D404_DATA_DIR`         | `./data`               | Directory for the SQLite DB + HMAC secret  |
 | `D404_DB_FILE`          | `<data>/deductive404.db`| Explicit database path                     |
 | `DATABASE_URL`          | *(unset)*              | PostgreSQL connection string — moves the whole store to PostgreSQL (see [RENDER.md](RENDER.md)) |
 | `D404_SECRET`           | auto-generated         | HMAC signing key (falls back to `data/secret.key`) |
+
+Engine selection, in order: `MONGODB_URI` set → MongoDB; else `DATABASE_URL` set →
+PostgreSQL; else the local SQLite file. Only one is used per process, and when a remote
+engine is unreachable the server **fails fast** with a clear error instead of pretending
+saves succeeded.
 
 ### Room capacity
 
@@ -306,6 +314,28 @@ meta         (key, value)     # one-time migrations, e.g. legacy content cleared
 uploads are stored as files under <data>/uploads/
 ```
 
+With `MONGODB_URI` set (MongoDB Atlas) the same records live as documents with the
+**same field names**, in these collections — cases embed inside their game document and
+the room's session embeds inside the room document, so a game and all of its cases save
+as one atomic write:
+
+| collection      | holds                                                                 |
+| --------------- | --------------------------------------------------------------------- |
+| `admins`        | game master accounts (same password hashing)                          |
+| `games`         | game metadata + embedded `cases[]` (question, options, correct answer, clue, image URL, points, order, status, timestamps) |
+| `rooms`         | room code, configuration, duration + embedded `session{}` (start/end/status) |
+| `players`       | one document per seat: score, case position, own `started_at`/`ends_at` |
+| `answers`       | every submission (activity feed + audit trail)                        |
+| `gameProgress`  | per-player, per-question attempts and points                          |
+| `meta`          | one-time flags (legacy cleanup, migration markers)                    |
+
+Indexes mirror the SQL unique constraints (`rooms.room_code`,
+`players(room_id,name_key)`, `gameProgress(player_id,case_number)`, `admins.username`),
+are created idempotently at boot, and startup never drops or resets a collection.
+If a local `data/deductive404.db` exists while the Atlas database is still empty, boot
+imports it **once** (flag-guarded, upsert-by-id, resumable) so existing games are not
+lost.
+
 `rooms.game_id`, `players.started_at` and `players.ends_at` are added to older databases by
 guarded boot migrations (`IF NOT EXISTS` schema + `ALTER TABLE` / `information_schema`
 checks, one additive step at a time) — existing users, logins, rooms, admin accounts and
@@ -343,13 +373,14 @@ through to the database immediately.
 | --- | --- |
 | Close tonight, reopen tomorrow | data lives in the engine, not in memory — `npm test` closes the database, reopens it and asserts every room, duration, row count, game and account is identical |
 | Survives Ctrl+C, crashes and redeploys | writes commit (`synchronous=FULL`, WAL) before the HTTP response is sent; SIGINT/SIGTERM/`exit` flush and checkpoint the WAL, and rolling `VACUUM INTO` backups are kept in `data/backups/` (five most recent) |
-| Never re-initialised on startup | `CREATE TABLE IF NOT EXISTS` plus additive, guarded column migrations only — boot never runs `DROP` / `DELETE` / re-create over an existing database |
+| Never re-initialised on startup | `CREATE TABLE IF NOT EXISTS` plus additive, guarded column migrations only — boot never runs `DROP` / `DELETE` / re-create over an existing database (MongoDB: index creation only) |
 | Rooms are never auto-deleted | only the explicit **DELETE ROOM** button (with confirmation) removes a room — creating or preparing one just saves it |
 | Saving ≠ starting | creating a room leaves it `waiting`; the game starts only when a detective presses their own **START** |
-| Production durability | set `DATABASE_URL` and the whole store moves to PostgreSQL (see [RENDER.md](RENDER.md) §4) — with it set but unreachable the server fails fast instead of silently running on an empty local file |
+| Production durability | set `MONGODB_URI` and every game, room, answer and timer lives in **MongoDB Atlas** (see [RENDER.md](RENDER.md) §4A) — save → restart → load returns the same data; with a remote engine unreachable the server fails fast instead of silently running on an empty local file |
 
-`npm run test:all` runs the complete suite against both engines (SQLite and the
-PostgreSQL dialect), including the close-and-reopen and killed-process restart checks.
+`npm run test:all` runs the complete suite against all three engines (SQLite, the
+PostgreSQL dialect and MongoDB — including a replica set, so the production transaction
+path is exercised), including the close-and-reopen and killed-process restart checks.
 
 ---
 

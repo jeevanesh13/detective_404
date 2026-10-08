@@ -210,7 +210,8 @@ export default function GamesScreen({ app, mode = "library", onBack, onNew }) {
     try {
       const data = await saveGame({ id: editing.id, name: editing.name, description: editing.description });
       setEditing(data.game);
-      setFlash("Game details saved.");
+      // Only after the database has confirmed the write (never optimistically).
+      setFlash("Game saved successfully.");
     } catch {
       /* surfaced */
     }
@@ -257,7 +258,7 @@ export default function GamesScreen({ app, mode = "library", onBack, onNew }) {
         if (!saved) return;
       }
     }
-    setFlash("All cases saved.");
+    setFlash("Game saved successfully — all cases saved.");
   };
 
   /* ------------------------------------------------------------------ *
@@ -516,6 +517,9 @@ export default function GamesScreen({ app, mode = "library", onBack, onNew }) {
                   </div>
                   <h4>{g.name}</h4>
                   {g.description && <p className="story">{g.description}</p>}
+                  {g.updatedAt ? (
+                    <p className="muted">Updated {new Date(g.updatedAt).toLocaleString()}</p>
+                  ) : null}
                   <div className="game-card-actions">
                     <button className="btn-primary" onClick={() => load(g.id)}>
                       OPEN EDITOR

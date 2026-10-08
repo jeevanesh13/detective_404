@@ -24,6 +24,33 @@ export const SECRET_FILE = path.join(DATA_DIR, "secret.key");
  */
 export const DATABASE_URL = process.env.DATABASE_URL || "";
 
+/**
+ * MongoDB Atlas connection string — the permanent source of truth in production.
+ *
+ *   unset        -> the SQL engine is used (SQLite locally, DATABASE_URL pg)
+ *   mongodb+srv://…  -> that Atlas cluster stores every game, room and answer
+ *
+ * Precedence: MONGODB_URI wins over DATABASE_URL. It is read here on the
+ * server ONLY — config.js is never imported by client code, so the string
+ * can never reach the browser bundle, an API response or a log line (only
+ * the host and database name, never user:password, are ever formatted).
+ */
+export const MONGODB_URI = process.env.MONGODB_URI || "";
+
+/** Database name inside the Atlas cluster (URI path, override, or default). */
+export const MONGODB_DB = (() => {
+  if (process.env.D404_MONGODB_DB) return process.env.D404_MONGODB_DB;
+  if (MONGODB_URI) {
+    try {
+      const pathname = new URL(MONGODB_URI).pathname.replace(/^\//, "").split("/")[0];
+      if (pathname) return pathname;
+    } catch {
+      /* fall through to the default */
+    }
+  }
+  return "deductive404";
+})();
+
 /** Case images uploaded from the Game Builder (never shipped with the site). */
 export const UPLOADS_DIR = path.join(DATA_DIR, "uploads");
 

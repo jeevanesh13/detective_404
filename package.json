@@ -14,9 +14,11 @@
     "server": "node server/index.js",
     "test": "node server/smoke.js",
     "test:pg": "node server/smoke.js --pg",
-    "test:all": "node server/smoke.js && node server/smoke.js --pg"
+    "test:mongo": "node server/smoke.js --mongo",
+    "test:all": "node server/smoke.js && node server/smoke.js --pg && node server/smoke.js --mongo"
   },
   "dependencies": {
+    "mongodb": "^7.7.0",
     "pg": "^8.23.1",
     "react": "^18.2.0",
     "react-dom": "^18.2.0"
@@ -24,9 +26,13 @@
   "devDependencies": {
     "@electric-sql/pglite": "^0.5.8",
     "@vitejs/plugin-react": "^4.2.1",
+    "mongodb-memory-server": "^11.3.0",
     "vite": "^5.2.0"
   },
   "engines": {
     "node": ">=22.13"
+  },
+  "allowScripts": {
+    "mongodb-memory-server@11.3.0": true
   }
 }
